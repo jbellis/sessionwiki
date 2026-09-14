@@ -27,6 +27,27 @@ cargo test --all
 The crate is a library (`src/lib.rs`) with a thin CLI binary (`src/main.rs`),
 so the parsing and indexing logic is testable and reusable as a dependency.
 
+## Change records and releases
+
+Every user-visible fix or update needs a `CHANGELOG.md` entry in the same
+change. Start under `Unreleased`, describe the concrete problem and resulting
+behavior, and use a meaningful commit message and PR description with the
+checks run and their results. A version bump or a generic "update" is not a
+change record. Keep credentials and private session content out of all records.
+
+When releasing, move the applicable entries into the matching version section;
+the tag workflow publishes that section as the GitHub release body. Record the
+tag/commit and actual publication results in the release or PR. After installing
+an update, also record the target, installed version and running-process
+verification. Distinguish local changes, pushed commits, published releases and
+installed updates; do not leave their only history in chat or claim that a
+commit on `main` is already installed.
+
+`main` requires the GitHub Actions `build & test` check to pass against an
+up-to-date branch. Force pushes and branch deletion are blocked, including for
+administrators. Submit changes through a branch and PR and wait for the required
+check; do not bypass protection to publish an update.
+
 ## Adding an adapter
 
 An adapter teaches sessionwiki where one tool stores sessions and how to parse
