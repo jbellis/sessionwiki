@@ -1,6 +1,6 @@
-use super::{dedup_paths, ok_or_flag, title_from_messages, Adapter, Discovered};
+use super::{dedup_paths, ok_or_flag, redacted_truncate, title_from_messages, Adapter, Discovered};
 use crate::model::{Message, Role, Session};
-use crate::util::{short_id, truncate};
+use crate::util::short_id;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -92,7 +92,7 @@ fn parse_session(tool: &'static str, path: &Path) -> Result<Session> {
         .get("title")
         .and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty() && *t != "New Session")
-        .map(|t| truncate(t, 80));
+        .map(|t| redacted_truncate(t, 80));
 
     let mut messages: Vec<Message> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
@@ -122,7 +122,7 @@ fn parse_session(tool: &'static str, path: &Path) -> Result<Session> {
                 push(
                     &mut messages,
                     Role::Tool,
-                    &format!("{name} {}", truncate(&detail, 300)),
+                    &format!("{name} {}", redacted_truncate(&detail, 300)),
                 );
             }
         }

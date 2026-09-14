@@ -29,6 +29,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test dependency auto-merge gate
+        run: python3 -m unittest discover -s .github/scripts -p 'test_deps_automerge.py'
       - name: Validate Claude Code plugin packaging
         run: |
           set -e

@@ -8,7 +8,7 @@
 //! root in `~/.local/share/prodex/bridges.json`, which is the discovery
 //! entry point here. `SESSIONWIKI_PRODEX_REGISTRY` overrides it for tests.
 
-use super::{Adapter, Discovered};
+use super::{redacted_first_line, Adapter, Discovered};
 use crate::model::{Message, Role, Session};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -31,25 +31,40 @@ fn registry_path() -> Option<PathBuf> {
     )
 }
 
-fn bridge_roots() -> Vec<PathBuf> {
+/// Read the registry without turning a broken/partial registry into a clean
+/// empty listing. A missing registry means Prodex is not installed and is
+/// normal; every other read, parse, or shape failure must suppress deletion
+/// reconciliation for this sync.
+fn bridge_roots() -> (Vec<PathBuf>, bool) {
     let Some(path) = registry_path() else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return (Vec::new(), true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), false);
+        }
+        Err(_) => return (Vec::new(), true),
+    }
     let Ok(text) = crate::util::read_to_string_capped(&path) else {
-        return Vec::new(); // absent, unreadable, or past the cap
+        return (Vec::new(), true);
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
+        return (Vec::new(), true);
     };
-    v["roots"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|r| r.as_str())
-                .map(PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(values) = v.get("roots").and_then(Value::as_array) else {
+        return (Vec::new(), true);
+    };
+    let mut roots = Vec::with_capacity(values.len());
+    let mut had_error = false;
+    for value in values {
+        match value.as_str() {
+            Some(root) if !root.is_empty() => roots.push(PathBuf::from(root)),
+            _ => had_error = true,
+        }
+    }
+    (roots, had_error)
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -97,27 +112,37 @@ impl Adapter for Prodex {
     fn root(&self) -> Option<PathBuf> {
         // For display/presence (`scan` shows this): the registry's directory,
         // consistent with every other adapter showing a store DIRECTORY.
-        // Discovery reads the registry file itself.
-        registry_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        // Discovery reads the registry file itself. Do not report its surviving
+        // parent as a present store after the registry disappears: sync would
+        // otherwise interpret absence of the entire store as deletion of every
+        // registered task.
+        registry_path()
+            .filter(|p| p.try_exists().unwrap_or(false))
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     fn discover(&self) -> Discovered {
         let mut files = Vec::new();
-        let mut had_error = false;
-        for root in bridge_roots() {
+        let (roots, mut had_error) = bridge_roots();
+        for root in roots {
             let tasks = root.join(".bridge").join("tasks");
-            if !tasks.is_dir() {
-                continue; // a registered repo may be gone - normal, not an error
-            }
             match std::fs::read_dir(&tasks) {
                 Ok(rd) => {
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        if p.extension().is_some_and(|x| x == "json") {
-                            files.push(p);
+                    for entry in rd {
+                        match entry {
+                            Ok(e) => {
+                                let p = e.path();
+                                if p.extension().is_some_and(|x| x == "json") {
+                                    files.push(p);
+                                }
+                            }
+                            Err(_) => had_error = true,
                         }
                     }
                 }
+                // A registered repo or a not-yet-used task store may be gone;
+                // both are legitimate absence, not incomplete discovery.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => had_error = true,
             }
         }
@@ -151,13 +176,7 @@ impl Adapter for Prodex {
         // which makes a list of them indistinguishable. Task title is the
         // fallback for promptless tasks.
         let title = {
-            let head: String = prompt
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(80)
-                .collect();
+            let head = redacted_first_line(&prompt, 80);
             if !head.is_empty() {
                 head
             } else {
@@ -206,7 +225,7 @@ impl Adapter for Prodex {
             )
             .ok()
             .map(|t| {
-                let mut t = t.trim().to_string();
+                let mut t = crate::redact::redact(t.trim()).into_owned();
                 const CAP: usize = 64 * 1024;
                 if t.len() > CAP {
                     let mut end = CAP;

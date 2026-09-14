@@ -88,6 +88,51 @@ fn rows_carry_the_active_account_from_the_swapdex_timeline() {
 }
 
 #[test]
+fn serve_off_boundary_clears_badges_until_later_restore() {
+    let _g = LOCK.lock().unwrap();
+    let conn = fresh("serve-off");
+    let t = tempfile::tempdir().unwrap();
+    let timeline = t.path().join("timeline.jsonl");
+    std::fs::write(
+        &timeline,
+        concat!(
+            "{\"ts\":1000,\"tool\":\"codex\",\"account\":\"payer\",\"action\":\"serve\"}\n",
+            "{\"ts\":2000,\"tool\":\"codex\",\"account\":\"\",\"action\":\"serve-off\"}\n",
+            "{\"ts\":3000,\"tool\":\"codex\",\"account\":\"home\",\"action\":\"restore\"}\n",
+        ),
+    )
+    .unwrap();
+    std::env::set_var("SESSIONWIKI_SWAPDEX_TIMELINE", &timeline);
+
+    for (id, ts) in [
+        ("during-serve", 1500),
+        ("after-off", 2500),
+        ("after-restore", 3500),
+    ] {
+        seed(
+            &conn,
+            id,
+            "codex",
+            &chrono::DateTime::from_timestamp(ts, 0)
+                .unwrap()
+                .to_rfc3339(),
+        );
+    }
+    let rows = index::recent(&conn, 10, None, None, None, false).unwrap();
+    let account = |id: &str| {
+        rows.iter()
+            .find(|row| row.session_id == id)
+            .unwrap()
+            .account
+            .as_deref()
+    };
+    assert_eq!(account("during-serve"), Some("payer"));
+    assert_eq!(account("after-off"), None);
+    assert_eq!(account("after-restore"), Some("home"));
+    std::env::remove_var("SESSIONWIKI_SWAPDEX_TIMELINE");
+}
+
+#[test]
 fn no_timeline_means_null_accounts() {
     let _g = LOCK.lock().unwrap();
     std::env::set_var(

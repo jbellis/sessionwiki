@@ -4,6 +4,8 @@
 
 use rusqlite::{params, Connection};
 use sessionwiki::{commands, index};
+use std::path::Path;
+use std::process::Output;
 use std::sync::Mutex;
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -219,4 +221,127 @@ fn brief_json_object_shape() {
     assert_eq!(v["id"], "s4");
     assert_eq!(v["tool"], "codex");
     assert_eq!(v["started"], "2026-06-10T10:00:00+00:00");
+}
+
+fn isolated_sessionwiki(
+    args: &[&str],
+    data: &Path,
+    home: &Path,
+    aider_roots: &Path,
+    prodex_registry: &Path,
+    timeline: &Path,
+) -> Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_sessionwiki"))
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("share"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("SESSIONWIKI_DATA", data)
+        .env("SESSIONWIKI_AIDER_ROOTS", aider_roots)
+        .env("SESSIONWIKI_PRODEX_REGISTRY", prodex_registry)
+        .env("SESSIONWIKI_SWAPDEX_TIMELINE", timeline)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn brief_and_summarizer_redact_reparsed_source_while_show_stays_raw() {
+    let _g = LOCK.lock().unwrap();
+    let t = tempfile::tempdir().unwrap();
+    let data = t.path().join("data");
+    let home = t.path().join("home");
+    let aider = t.path().join("aider");
+    std::fs::create_dir_all(&aider).unwrap();
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    let source_dir = t.path().join(secret);
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("conversation.jsonl");
+    std::fs::write(
+        &source,
+        format!(
+            "{{\"role\":\"user\",\"content\":\"rotate {secret}\",\"timestamp\":\"2026-06-10T10:00:00\"}}\n\
+             {{\"role\":\"assistant\",\"content\":\"body {secret}\",\"timestamp\":\"2026-06-10T10:01:00\"}}\n"
+        ),
+    )
+    .unwrap();
+
+    std::env::set_var("SESSIONWIKI_DATA", &data);
+    let conn = index::open().unwrap();
+    conn.execute(
+        "INSERT INTO files(path,mtime,size,session_id,tool,project,title,started,ended,msg_count,kind)
+         VALUES(?1,0,0,'raw-brief','gptme','already-redacted','already-redacted',
+                '2026-06-10T10:00:00+00:00','2026-06-10T10:01:00+00:00',2,'main')",
+        params![source.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO messages(session_id,role,text) VALUES('raw-brief','user','[redacted:openai]')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    std::env::remove_var("SESSIONWIKI_DATA");
+
+    let registry = t.path().join("absent-bridges.json");
+    let timeline = t.path().join("absent-timeline.jsonl");
+    let run =
+        |args: &[&str]| isolated_sessionwiki(args, &data, &home, &aider, &registry, &timeline);
+
+    let plain = run(&["brief", "raw-brief", "--no-sync"]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(!plain.contains(secret), "plain brief leaked: {plain}");
+    assert!(
+        plain.matches("[redacted:openai]").count() >= 4,
+        "title, project, source, and body are marked: {plain}"
+    );
+
+    let json = run(&["brief", "raw-brief", "--no-sync", "--json"]);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json_text = String::from_utf8(json.stdout).unwrap();
+    assert!(
+        !json_text.contains(secret),
+        "JSON brief leaked: {json_text}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+    for field in ["project", "title", "source", "markdown"] {
+        assert!(
+            value[field]
+                .as_str()
+                .is_some_and(|s| s.contains("[redacted:openai]")),
+            "{field} was not redacted: {value}"
+        );
+    }
+
+    let check_stdin =
+        format!("if grep -Fq '{secret}'; then exit 9; else printf 'safe summary'; fi");
+    let summarized = run(&["summarize", "raw-brief", "--cmd", &check_stdin, "--force"]);
+    let summarized_out = String::from_utf8(summarized.stdout).unwrap();
+    let summarized_err = String::from_utf8(summarized.stderr).unwrap();
+    assert!(summarized.status.success(), "{summarized_err}");
+    assert!(
+        summarized_out.contains("safe summary") && !summarized_err.contains("summarizer failed"),
+        "summarizer received an unredacted export:\nstdout={summarized_out}\nstderr={summarized_err}"
+    );
+
+    let shown = run(&["show", "raw-brief", "--no-sync", "--json"]);
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(
+        String::from_utf8(shown.stdout).unwrap().contains(secret),
+        "local raw show must retain the source transcript"
+    );
 }

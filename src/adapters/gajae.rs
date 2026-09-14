@@ -1,6 +1,8 @@
-use super::{dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered};
+use super::{
+    dedup_paths, ok_or_flag, parse_ts, redacted_truncate, title_from_messages, Adapter, Discovered,
+};
 use crate::model::{Message, Role, Session};
-use crate::util::{short_id, truncate};
+use crate::util::short_id;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -136,7 +138,7 @@ fn parse_jsonl(tool: &'static str, path: &Path) -> Result<Session> {
                     .get("title")
                     .and_then(Value::as_str)
                     .filter(|t| !t.trim().is_empty())
-                    .map(|t| truncate(t, 80));
+                    .map(|t| redacted_truncate(t, 80));
             }
             Some("message") => {
                 let Some(msg) = entry.get("message") else {
@@ -179,7 +181,7 @@ fn parse_jsonl(tool: &'static str, path: &Path) -> Result<Session> {
                                     push(
                                         &mut messages,
                                         Role::Tool,
-                                        &format!("{name} {}", truncate(&a, 300)),
+                                        &format!("{name} {}", redacted_truncate(&a, 300)),
                                         ts,
                                     );
                                 }

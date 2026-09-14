@@ -1,6 +1,8 @@
-use super::{dedup_paths, ok_or_flag, title_from_messages, Adapter, Discovered, Store};
+use super::{
+    dedup_paths, ok_or_flag, redacted_truncate, title_from_messages, Adapter, Discovered, Store,
+};
 use crate::model::{Message, Role, Session};
-use crate::util::{short_id, truncate};
+use crate::util::short_id;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags};
@@ -192,7 +194,7 @@ impl Adapter for OpenCode {
                         push(
                             &mut messages,
                             Role::Tool,
-                            &format!("{tool} {}", truncate(&input, 300)),
+                            &format!("{tool} {}", redacted_truncate(&input, 300)),
                             ts,
                         );
                     }
@@ -214,7 +216,7 @@ impl Adapter for OpenCode {
         let title = if raw_title.trim().is_empty() || raw_title.starts_with("New session") {
             title_from_messages(&messages)
         } else {
-            truncate(&raw_title, 80)
+            redacted_truncate(&raw_title, 80)
         };
 
         Ok(Session {
@@ -331,7 +333,7 @@ fn parse_json(tool: &'static str, path: &Path) -> Result<Session> {
         .get("title")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty() && !t.starts_with("New session"))
-        .map(|t| truncate(t, 80));
+        .map(|t| redacted_truncate(t, 80));
 
     let store = path
         .parent()
@@ -386,7 +388,7 @@ fn parse_json(tool: &'static str, path: &Path) -> Result<Session> {
                         push(
                             &mut messages,
                             Role::Tool,
-                            &format!("{tool} {}", truncate(&input, 300)),
+                            &format!("{tool} {}", redacted_truncate(&input, 300)),
                             ts,
                         );
                     }

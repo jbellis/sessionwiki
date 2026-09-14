@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning once it reaches 1.0.
 
+## [Unreleased]
+
+### Fixed
+
+- **Exported session fields are redacted before they are shortened.** Briefs,
+  summarizer input and MCP session windows now redact the complete parsed
+  session, including titles, project names, paths, messages and edit snippets,
+  before rendering or applying length limits. This covers reparsed originals
+  and archived sessions, including single-turn MCP output. A token cut by a
+  preview or output budget can no longer survive as an unrecognized prefix.
+- **Prompt-derived titles and previews no longer preserve credential fragments.**
+  Redaction runs before adapters select a title line or shorten tool previews,
+  edit snippets and Prodex answers, including structured tool input and
+  multiline private keys.
+- **Turning off swapdex serving clears subsequent account badges.**
+  `serve-off` is an explicit attribution boundary until a later `use`,
+  `restore` or `serve` event activates an account. It no longer leaves the
+  previous account attached to later sessions.
+- **Incomplete discovery no longer looks like deleted sessions.** Aider walk
+  errors and unreadable, malformed or partial Prodex registry/task listings
+  retain the incomplete-discovery signal, so synchronization preserves live
+  sessions until a complete listing can reconcile deletions.
+
+### Maintenance
+
+- Update `dirs` from 6 to 7. Its upstream behavior change affects Windows
+  `preference_dir()`, which sessionwiki does not call; the home, configuration
+  and data directory functions used for session discovery remain unchanged.
+  The update was checked against the current implementation with 205 Rust
+  tests and clippy passing.
+- Dependency auto-merge now verifies the workflow, repository, PR and tested
+  commit, checks permitted manifest and lockfile changes structurally, and
+  rechecks current state before merging. Incomplete or inconsistent evidence
+  refuses the merge. The gate's regression tests run in CI.
+
+The review fixes and auto-merge hardening are on `main` in
+[a1ef3a8](https://github.com/youdie006/sessionwiki/commit/a1ef3a884cacecb1b495fff5710709318de8ffc0),
+whose [CI run](https://github.com/youdie006/sessionwiki/actions/runs/34811418806)
+passed. The `dirs` update is tracked in
+[PR #21](https://github.com/youdie006/sessionwiki/pull/21). These changes are not
+part of the published `v0.26.0` release; publication and installation of a later
+version must be recorded separately.
+
 ## [0.26.0] - 2026-09-07
 
 ### Fixed

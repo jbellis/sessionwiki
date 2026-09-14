@@ -494,7 +494,7 @@ fn tool_window(conn: &mut Option<Connection>, args: &Value) -> Value {
             )
         }
     };
-    let session = match matches.as_slice() {
+    let mut session = match matches.as_slice() {
         [] => {
             // Not indexed. A live session started moments ago (e.g. via its
             // native rollout/transcript UUID from a harness tower) still has its
@@ -548,6 +548,11 @@ fn tool_window(conn: &mut Option<Connection>, args: &Value) -> Value {
             );
         }
     };
+    // Redact the complete parsed session before either renderer can cap, fold,
+    // or budget it. A response-only pass is too late: a token straddling a cap
+    // becomes a short prefix that no longer matches the credential pattern.
+    crate::commands::redact_session_for_export(&mut session);
+
     // Per-turn drill-down: return one turn's full, untruncated text.
     if let Some(t) = turn {
         if t < 0 {
@@ -715,6 +720,7 @@ fn tool_brief(conn: &mut Option<Connection>, args: &Value) -> Value {
             )
         }
     };
+    crate::commands::redact_session_for_export(&mut session);
     // The header title/project are short untrusted metadata: neutralize the
     // title (fence/tag forgery) and redact the home dir from the project before
     // brief_text bakes them into the header. The message BODY is left as
@@ -993,6 +999,83 @@ mod tests {
                     .iter()
                     .any(|t| t["text"].as_str().unwrap_or("").contains("rate limiter")),
                 "the real turn is rendered for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_redacts_reparsed_raw_fields_before_window_and_turn_caps() {
+        let _lock = LOCK.lock().unwrap();
+        let _c = seed("sessionwiki-test-mcp-window-raw-redaction");
+        let source_root = tempfile::tempdir().unwrap();
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        let project = source_root.path().join(secret);
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join("conversation.jsonl");
+        let window_straddle = format!("{} {secret} {}", "a".repeat(1581), "b".repeat(2000));
+        let turn_straddle = format!("{} {secret} {}", "c".repeat(22_981), "d".repeat(100));
+        std::fs::write(
+            &source,
+            format!(
+                "{{\"role\":\"user\",\"content\":\"title {secret}\"}}\n\
+                 {{\"role\":\"assistant\",\"content\":\"{window_straddle}\"}}\n\
+                 {{\"role\":\"user\",\"content\":\"{turn_straddle}\"}}\n"
+            ),
+        )
+        .unwrap();
+        _c.execute(
+            "UPDATE files SET path=?1, tool='gptme', project='indexed-safe', title='indexed-safe', msg_count=3 WHERE session_id='s1'",
+            rusqlite::params![source.to_string_lossy()],
+        )
+        .unwrap();
+
+        let (_v, text) = tool("session_window", json!({"id": "s1", "budget_tokens": 8000}));
+        let window: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            !text.contains(secret) && !text.contains("sk-"),
+            "window leaked: {text}"
+        );
+        assert!(
+            text.contains("[redacted:openai]"),
+            "complete title/body must be redacted before the 3,200-char cap: {window}"
+        );
+
+        let (_v, text) = tool("session_window", json!({"id": "s1", "turn": 2}));
+        let turn: Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            !text.contains(secret) && !text.contains("sk-"),
+            "turn leaked: {text}"
+        );
+        assert!(
+            turn["text"]
+                .as_str()
+                .is_some_and(|s| s.contains("[redacted:openai]")),
+            "the full body must be redacted before the 23,000-char cap: {turn}"
+        );
+    }
+
+    #[test]
+    fn window_redacts_archived_index_fields_for_window_and_turn() {
+        let _lock = LOCK.lock().unwrap();
+        let conn = seed("sessionwiki-test-mcp-window-archived-redaction");
+        let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        conn.execute(
+            "UPDATE files SET project=?1, title=?1, archived_at='2026-06-11T00:00:00Z' WHERE session_id='s1'",
+            rusqlite::params![format!("archived {secret}")],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE messages SET text=?1 WHERE session_id='s1'",
+            rusqlite::params![format!("archived body {secret}")],
+        )
+        .unwrap();
+
+        for args in [json!({"id": "s1"}), json!({"id": "s1", "turn": 0})] {
+            let (_v, text) = tool("session_window", args);
+            serde_json::from_str::<Value>(&text).unwrap();
+            assert!(
+                !text.contains(secret) && text.contains("[redacted:openai]"),
+                "archived export was not redacted: {text}"
             );
         }
     }

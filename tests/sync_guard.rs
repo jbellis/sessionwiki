@@ -165,6 +165,51 @@ fn a_partial_shared_store_walk_says_it_skipped_reconciliation() {
     );
 }
 
+#[test]
+fn aider_capped_history_read_does_not_archive_existing_runs() {
+    let t = tempfile::tempdir().unwrap();
+    let data = t.path().join("data");
+    let roots = t.path().join("roots");
+    fs::create_dir_all(&roots).unwrap();
+    let history = roots.join(".aider.chat.history.md");
+    fs::write(
+        &history,
+        "# aider chat started at 2026-06-09 14:01:00\n#### keep this run\nkept\n",
+    )
+    .unwrap();
+
+    let sync = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sessionwiki"))
+            .args(["sync", "--tool", "aider"])
+            .env("SESSIONWIKI_DATA", &data)
+            .env("SESSIONWIKI_AIDER_ROOTS", &roots)
+            .output()
+            .unwrap()
+    };
+    let first = sync();
+    assert!(first.status.success());
+    let conn = Connection::open(data.join("index.db")).unwrap();
+    assert_eq!(archived(&conn, "aider.chat.history"), Some(false));
+
+    // Sparse extension: exercises the 256 MiB read cap without allocating or
+    // writing a massive string.
+    let file = fs::OpenOptions::new().write(true).open(&history).unwrap();
+    file.set_len(sessionwiki::util::MAX_SESSION_FILE_BYTES + 1)
+        .unwrap();
+    let second = sync();
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "sync failed: {stderr}");
+    assert!(
+        stderr.contains("skipping deletion reconciliation"),
+        "capped read must mark discovery incomplete: {stderr}"
+    );
+    assert_eq!(
+        archived(&conn, "aider.chat.history"),
+        Some(false),
+        "a read-size failure is not deletion"
+    );
+}
+
 extern "C" {
     #[link_name = "geteuid"]
     fn libc_geteuid() -> u32;
