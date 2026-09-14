@@ -204,8 +204,29 @@ pub(crate) fn title_from_messages(messages: &[crate::model::Message]) -> String 
                 && !m.text.trim_start().starts_with('<')
                 && !m.text.trim().is_empty()
         })
-        .map(|m| crate::util::truncate(&m.text, 80))
+        .map(|m| redacted_truncate(&m.text, 80))
         .unwrap_or_else(|| "(no user prompt)".into())
+}
+
+/// Redact the complete logical value before bounding a derived field. The
+/// order matters: truncating first can leave a credential prefix too short for
+/// the redactor to recognize.
+pub(crate) fn redacted_truncate(text: &str, max: usize) -> String {
+    crate::util::truncate(&crate::redact::redact(text), max)
+}
+
+/// First-line title variant for adapters whose existing format uses a hard
+/// character cap without an ellipsis. Redaction happens before line selection
+/// so a multi-line credential is considered as one logical value.
+pub(crate) fn redacted_first_line(text: &str, max: usize) -> String {
+    let redacted = crate::redact::redact(text);
+    redacted
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(max)
+        .collect()
 }
 
 pub(crate) fn parse_ts(s: &str) -> Option<DateTime<Utc>> {

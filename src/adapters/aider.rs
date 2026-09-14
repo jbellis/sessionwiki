@@ -6,7 +6,7 @@
 //! No per-message timestamps; `started` is the run header (local time, assumed
 //! UTC). Reads are size-capped; discovery is bounded and logs nothing.
 
-use crate::adapters::{Adapter, Store};
+use crate::adapters::{redacted_first_line, Adapter, Store};
 use crate::model::{Message, Role, Session};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -239,10 +239,7 @@ fn title_from(messages: &[Message]) -> String {
     messages
         .iter()
         .find(|m| m.role == Role::User && !m.text.trim().is_empty())
-        .map(|m| {
-            let t = m.text.trim();
-            t.lines().next().unwrap_or(t).chars().take(80).collect()
-        })
+        .map(|m| redacted_first_line(m.text.trim(), 80))
         .unwrap_or_default()
 }
 
@@ -320,7 +317,7 @@ impl Adapter for Aider {
     }
 
     fn store(&self) -> Option<Store> {
-        let (history_files, had_error) = discover_history(&aider_roots());
+        let (history_files, mut had_error) = discover_history(&aider_roots());
         let mut keys: Vec<(String, i64)> = Vec::new();
         for path in &history_files {
             // token = file mtime (ms), shared across all runs of the file, so any
@@ -331,8 +328,15 @@ impl Adapter for Aider {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let Ok(content) = crate::util::read_to_string_capped(path) else {
-                continue;
+            let content = match crate::util::read_to_string_capped(path) {
+                Ok(content) => content,
+                Err(_) => {
+                    // Discovery saw the history, but its complete run list
+                    // could not be read. An empty key set is therefore partial
+                    // and must not drive deletion reconciliation.
+                    had_error = true;
+                    continue;
+                }
             };
             let runs = split_runs(&content);
             for idx in 0..runs.len() {

@@ -3,9 +3,10 @@
 //! (read-only). No swapdex on the machine -> no events -> no badges, silently.
 //!
 //! The join mirrors swapdex's own `sessions` attribution: a session belongs to
-//! the last `use`/`restore` event for its tool with ts <= session start. A
-//! session that predates every switch stays unattributed (None) - a missing
-//! badge, never a guess.
+//! the last activating event (`use`, `restore`, or `serve`) for its tool with ts
+//! <= session start, unless a later `serve-off` cleared that state. A session
+//! that predates every event stays unattributed (None) - a missing badge, never
+//! a guess.
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -15,8 +16,8 @@ pub struct SwitchEvent {
     pub tool: String,
     pub account: String,
     /// What swapdex recorded: `use`/`restore` move where new sessions start,
-    /// `serve` hands turns to an account without moving them. Both are evidence
-    /// of which account was live at that moment, which is all this needs.
+    /// `serve` hands turns to an account without moving them, while `serve-off`
+    /// explicitly clears that attribution until a later activating event.
     pub action: String,
 }
 
@@ -29,8 +30,8 @@ fn timeline_path() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("swapdex").join("timeline.jsonl"))
 }
 
-/// Parse the timeline defensively: keep the events that name a live account and
-/// skip malformed lines.
+/// Parse the timeline defensively: keep activating events and the explicit
+/// `serve-off` boundary, and skip malformed lines.
 ///
 /// `serve` counts. It was dropped here as "not a switch", which was true of the
 /// event and false of the question: on a machine where switching goes through
@@ -66,22 +67,34 @@ fn parse_events(text: &str) -> Vec<SwitchEvent> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        // A line written before swapdex recorded actions carries none, and
-        // those were all switches.
-        let action = v["action"].as_str().unwrap_or("use");
-        if !matches!(action, "use" | "restore" | "serve") {
+        // A line written before swapdex recorded actions carries no field, and
+        // those were all switches. A present value of another JSON type is
+        // malformed, not legacy.
+        let action = match v.get("action") {
+            None => "use",
+            Some(Value::String(action)) => action,
+            Some(_) => continue,
+        };
+        if !matches!(action, "use" | "restore" | "serve" | "serve-off") {
             continue;
         }
         if let (Some(ts), Some(tool), Some(account)) =
             (v["ts"].as_i64(), v["tool"].as_str(), v["account"].as_str())
         {
+            let account: String = account.chars().filter(|c| !c.is_control()).collect();
+            // Active-account events need a real badge. `serve-off` deliberately
+            // carries an empty account in swapdex's cross-repo protocol; keep
+            // it as a boundary rather than dropping or treating it as a badge.
+            if action != "serve-off" && account.is_empty() {
+                continue;
+            }
             out.push(SwitchEvent {
                 ts,
                 tool: tool.to_string(),
                 action: action.to_string(),
                 // Strip control chars at the source: every consumer (CLI
                 // badge, web, JSON) then gets a terminal-safe name.
-                account: account.chars().filter(|c| !c.is_control()).collect(),
+                account,
             });
         }
     }
@@ -89,8 +102,10 @@ fn parse_events(text: &str) -> Vec<SwitchEvent> {
 }
 
 /// The profile active when a session of `tool` started: the newest event for
-/// that tool at or before it, whatever kind. None when there is none - including
-/// the no-swapdex case - so a missing badge is still never a guess.
+/// that tool at or before it, whatever kind. Equal timestamps use append order,
+/// matching the timeline's event-log semantics. `serve-off` returns None and
+/// does not fall through to an older account. None also covers no prior event or
+/// no swapdex timeline, so a missing badge is still never a guess.
 pub fn account_for(
     events: &[SwitchEvent],
     tool: &str,
@@ -101,9 +116,14 @@ pub fn account_for(
         .timestamp();
     events
         .iter()
-        .filter(|e| e.tool == tool && e.ts <= started)
-        .max_by_key(|e| e.ts)
-        .map(|e| e.account.clone())
+        .enumerate()
+        .filter(|(_, e)| e.tool == tool && e.ts <= started)
+        .max_by_key(|(order, e)| (e.ts, *order))
+        .and_then(|(_, e)| match e.action.as_str() {
+            "use" | "restore" | "serve" => Some(e.account.clone()),
+            "serve-off" => None,
+            _ => None,
+        })
 }
 
 /// Fill `account` on freshly queried rows. One timeline read per query call;
@@ -156,9 +176,13 @@ mod tests {
             "\n",
             r#"{"ts":1,"tool":"codex","account":"legacy"}"#,
             "\n",
+            r#"{"ts":3,"tool":"codex","account":"","action":"serve-off"}"#,
+            "\n",
             r#"not json"#,
             "\n",
             r#"{"ts":2,"tool":"codex","account":"nope","action":"something-new"}"#,
+            "\n",
+            r#"{"ts":4,"tool":"codex","account":"typed-null","action":null}"#,
         );
         let events = parse_events(text);
         let kept: Vec<(&str, &str)> = events
@@ -172,8 +196,69 @@ mod tests {
                 ("use", "codex"),
                 ("serve", "work"),
                 ("use", "legacy"),
+                ("serve-off", ""),
             ],
-            "serves are kept, an action swapdex does not write today is not"
+            "serve boundaries and legacy uses are kept; unknown actions are not"
+        );
+    }
+
+    #[test]
+    fn serve_off_clears_attribution_until_a_later_activation() {
+        let off = SwitchEvent {
+            ts: 200,
+            tool: "codex".into(),
+            account: String::new(),
+            action: "serve-off".into(),
+        };
+        let events = vec![serve(100, "codex", "payer"), off];
+        assert_eq!(
+            account_for(&events, "codex", Some(&at(250))),
+            None,
+            "serve-off is a state boundary, not an empty account badge"
+        );
+
+        for action in ["use", "restore", "serve"] {
+            let mut resumed = events
+                .iter()
+                .map(|e| SwitchEvent {
+                    ts: e.ts,
+                    tool: e.tool.clone(),
+                    account: e.account.clone(),
+                    action: e.action.clone(),
+                })
+                .collect::<Vec<_>>();
+            resumed.push(SwitchEvent {
+                ts: 300,
+                tool: "codex".into(),
+                account: "home".into(),
+                action: action.into(),
+            });
+            assert_eq!(
+                account_for(&resumed, "codex", Some(&at(350))).as_deref(),
+                Some("home"),
+                "a later {action} restores attribution"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_timestamps_use_append_order() {
+        let events = parse_events(concat!(
+            r#"{"ts":100,"tool":"codex","account":"payer","action":"serve"}"#,
+            "\n",
+            r#"{"ts":100,"tool":"codex","account":"","action":"serve-off"}"#,
+            "\n",
+            r#"{"ts":100,"tool":"codex","account":"home","action":"use"}"#,
+        ));
+        assert_eq!(
+            account_for(&events[..2], "codex", Some(&at(100))),
+            None,
+            "the later appended serve-off wins a timestamp tie"
+        );
+        assert_eq!(
+            account_for(&events, "codex", Some(&at(100))).as_deref(),
+            Some("home"),
+            "a still-later use at the same timestamp wins"
         );
     }
 

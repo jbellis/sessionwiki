@@ -1,6 +1,8 @@
-use super::{dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered};
+use super::{
+    dedup_paths, ok_or_flag, parse_ts, redacted_truncate, title_from_messages, Adapter, Discovered,
+};
 use crate::model::{Message, Role, Session};
-use crate::util::{short_id, truncate};
+use crate::util::short_id;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -128,7 +130,7 @@ impl Adapter for Codex {
                             // wrapping it. Scan the full args for the file
                             // markers before the message text is truncated.
                             collect_patched_paths(args, &mut touched);
-                            let text = format!("{name} {}", truncate(args, 300));
+                            let text = format!("{name} {}", redacted_truncate(args, 300));
                             push(&mut messages, Role::Tool, &text, ts);
                         }
                         // function_call_output and reasoning are skipped on

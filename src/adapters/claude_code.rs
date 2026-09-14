@@ -1,8 +1,9 @@
 use super::{
-    clean_path, dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered,
+    clean_path, dedup_paths, ok_or_flag, parse_ts, redacted_truncate, title_from_messages, Adapter,
+    Discovered,
 };
 use crate::model::{Message, Role, Session};
-use crate::util::{short_id, truncate};
+use crate::util::short_id;
 use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -116,7 +117,12 @@ impl Adapter for ClaudeCode {
                                     Some("tool_result") => {
                                         let t = block_text(b.get("content"));
                                         if !t.is_empty() {
-                                            push(&mut messages, Role::Tool, &truncate(&t, 500), ts);
+                                            push(
+                                                &mut messages,
+                                                Role::Tool,
+                                                &redacted_truncate(&t, 500),
+                                                ts,
+                                            );
                                         }
                                     }
                                     _ => {}
@@ -149,7 +155,7 @@ impl Adapter for ClaudeCode {
                                 }
                                 let input =
                                     b.get("input").map(|i| i.to_string()).unwrap_or_default();
-                                let text = format!("{name} {}", truncate(&input, 300));
+                                let text = format!("{name} {}", redacted_truncate(&input, 300));
                                 push(&mut messages, Role::Tool, &text, ts);
                             }
                             _ => {}
@@ -169,7 +175,7 @@ impl Adapter for ClaudeCode {
         });
         let base_title = summary
             .or(ai_title)
-            .map(|s| truncate(&s, 80))
+            .map(|s| redacted_truncate(&s, 80))
             .unwrap_or_else(|| title_from_messages(&messages));
         // Flag a windowed session so search/list/window make the partial read obvious.
         let title = if windowed {
@@ -254,7 +260,7 @@ fn edit_event(
             .unwrap_or(""),
         EditKind::NotebookEdit => str_field(input, &["new_source"]),
     };
-    let snippet = truncate(raw.trim(), SNIPPET_CAP);
+    let snippet = redacted_truncate(raw.trim(), SNIPPET_CAP);
     Some(EditEvent {
         path,
         kind,

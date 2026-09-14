@@ -1,6 +1,6 @@
-use super::{dedup_paths, title_from_messages, Adapter, Discovered};
+use super::{dedup_paths, redacted_truncate, title_from_messages, Adapter, Discovered};
 use crate::model::{Message, Role, Session};
-use crate::util::{short_id, truncate};
+use crate::util::short_id;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -268,7 +268,7 @@ fn parse_task(tool: &'static str, path: &Path) -> Result<Session> {
                     push(
                         &mut messages,
                         Role::Tool,
-                        &format!("{name} {}", truncate(&arg, 300)),
+                        &format!("{name} {}", redacted_truncate(&arg, 300)),
                     );
                 }
                 _ => {}
@@ -428,7 +428,7 @@ fn ui_summary(
             .find(|e| e.get("say").and_then(Value::as_str) == Some("task"))
             .and_then(|e| e.get("text").and_then(Value::as_str))
             .filter(|t| !t.trim().is_empty())
-            .map(|t| truncate(t, 80))
+            .map(|t| redacted_truncate(t, 80))
     });
 
     let mut stamps: Vec<i64> = events

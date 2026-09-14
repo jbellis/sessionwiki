@@ -362,7 +362,8 @@ pub fn recall(
     // The top hit is briefed; the rest are listed so a wrong #1 is easy to spot
     // (ranking is lexical, not semantic).
     let top = &hits[0];
-    let session = load_session(&conn, &top.row)?;
+    let mut session = load_session(&conn, &top.row)?;
+    redact_session_for_export(&mut session);
     let markdown = brief_text(&session, max_chars, false, true);
 
     if json {
@@ -789,6 +790,45 @@ pub(crate) fn load_session(
     }
 }
 
+/// Redact every untrusted string carried by a parsed session before it crosses
+/// an export boundary. This is deliberately separate from `load_session`:
+/// local `show` is a raw reader and must retain the source transcript, while
+/// brief/summarizer/MCP output may leave the terminal or process. Call this on
+/// the complete parsed session, before any message cap, fold, or total budget,
+/// so clipping can never turn a recognizable credential into an unrecognizable
+/// leaked prefix.
+pub(crate) fn redact_session_for_export(session: &mut crate::model::Session) {
+    fn clean(s: &mut String) {
+        if let std::borrow::Cow::Owned(redacted) = crate::redact::redact(s) {
+            *s = redacted;
+        }
+    }
+
+    clean(&mut session.id);
+    clean(&mut session.project);
+    clean(&mut session.title);
+    let redacted_path = {
+        let path = session.path.to_string_lossy();
+        match crate::redact::redact(&path) {
+            std::borrow::Cow::Owned(redacted) => Some(redacted),
+            std::borrow::Cow::Borrowed(_) => None,
+        }
+    };
+    if let Some(path) = redacted_path {
+        session.path = path.into();
+    }
+    for message in &mut session.messages {
+        clean(&mut message.text);
+    }
+    for path in &mut session.touched {
+        clean(path);
+    }
+    for edit in &mut session.edits {
+        clean(&mut edit.path);
+        clean(&mut edit.snippet);
+    }
+}
+
 /// Resolve an id prefix to exactly one indexed session.
 /// Resolve a session id, syncing once only if it is not already indexed. This
 /// skips the all-tools walk for ids already in the index (the common case: you
@@ -945,7 +985,8 @@ pub fn brief(
 ) -> Result<()> {
     let mut conn = index::open()?;
     let row = resolve_lazy(&mut conn, id, no_sync)?;
-    let session = load_session(&conn, &row)?;
+    let mut session = load_session(&conn, &row)?;
+    redact_session_for_export(&mut session);
     let markdown = brief_text(&session, max_chars, include_tools, true);
     if json {
         let v = serde_json::json!({
@@ -1046,15 +1087,21 @@ pub(crate) fn brief_text(
     // The Source line is the absolute session-file path; omitted for the MCP
     // path so a home dir / username never reaches a consuming agent.
     let source_line = if include_source {
-        format!("\n- Source: {}", session.path.display())
+        format!(
+            "\n- Source: {}",
+            crate::redact::redact(&session.path.display().to_string())
+        )
     } else {
         String::new()
     };
+    let title = crate::redact::redact(&session.title);
+    let tool = crate::redact::redact(session.tool);
+    let project = crate::redact::redact(&session.project);
     format!(
         "# Previous session: {}\n\n- Tool: {} | Project: {} | Date: {}{}\n\n{}\n",
-        session.title,
-        session.tool,
-        session.project,
+        title,
+        tool,
+        project,
         fmt_date(session.started),
         source_line,
         body
@@ -1110,13 +1157,14 @@ pub fn summarize(
             );
             continue;
         }
-        let session = match load_session(&conn, row) {
+        let mut session = match load_session(&conn, row) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{} parse failed: {e:#}", yellow(&row.session_id));
                 continue;
             }
         };
+        redact_session_for_export(&mut session);
         eprintln!(
             "{}",
             dim(&format!(
@@ -1825,14 +1873,19 @@ mod tests {
         // it to a connected agent. The index these same messages are stored in
         // has had credentials stripped since the beginning; this path had not.
         let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        // At a 1,600-char budget each message block is capped at 400 chars.
+        // The raw token starts at byte 382 of this rendered block, so clipping
+        // first would leave an 18-char prefix that no longer matches the
+        // redactor. Redacting the complete body first leaves the whole marker.
+        let straddling = format!("{} {secret} {}", "x".repeat(366), "z".repeat(500));
         let session = Session {
             id: "s1".into(),
             tool: "claude-code",
-            path: std::path::PathBuf::from("/tmp/s.jsonl"),
-            project: "/tmp".into(),
+            path: std::path::PathBuf::from(format!("/tmp/{secret}/s.jsonl")),
+            project: format!("/tmp/{secret}"),
             started: None,
             ended: None,
-            title: "t".into(),
+            title: format!("rotate {secret}"),
             subagent: false,
             messages: vec![
                 Message {
@@ -1842,18 +1895,18 @@ mod tests {
                 },
                 Message {
                     role: Role::Assistant,
-                    text: "ok".into(),
+                    text: straddling,
                     ts: None,
                 },
             ],
             touched: Vec::new(),
             edits: Vec::new(),
         };
-        let out = brief_text(&session, 8000, false, false);
+        let out = brief_text(&session, 1600, false, true);
         assert!(!out.contains(secret), "the brief still carries it:\n{out}");
         assert!(
-            out.contains("[redacted:"),
-            "and says so rather than dropping it silently:\n{out}"
+            out.matches("[redacted:openai]").count() >= 5,
+            "title, project, source, and both complete bodies are redacted before budgeting:\n{out}"
         );
         // Ordinary prose is untouched - the bar is high-confidence shapes only.
         assert!(out.contains("here is the key") && out.contains("use it"));
