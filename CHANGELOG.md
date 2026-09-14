@@ -6,6 +6,8 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-09-15
+
 ### Fixed
 
 - **Exported session fields are redacted before they are shortened.** Briefs,
@@ -39,13 +41,10 @@ semantic versioning once it reaches 1.0.
   rechecks current state before merging. Incomplete or inconsistent evidence
   refuses the merge. The gate's regression tests run in CI.
 
-The review fixes and auto-merge hardening are on `main` in
-[a1ef3a8](https://github.com/youdie006/sessionwiki/commit/a1ef3a884cacecb1b495fff5710709318de8ffc0),
-whose [CI run](https://github.com/youdie006/sessionwiki/actions/runs/34811418806)
-passed. The `dirs` update is tracked in
-[PR #21](https://github.com/youdie006/sessionwiki/pull/21). These changes are not
-part of the published `v0.26.0` release; publication and installation of a later
-version must be recorded separately.
+Implementation and review: [a1ef3a8](https://github.com/youdie006/sessionwiki/commit/a1ef3a884cacecb1b495fff5710709318de8ffc0)
+and [PR #21](https://github.com/youdie006/sessionwiki/pull/21). Publication and
+installation verification are recorded in the
+[0.27.0 release](https://github.com/youdie006/sessionwiki/releases/tag/v0.27.0).
 
 ## [0.26.0] - 2026-09-07
 
