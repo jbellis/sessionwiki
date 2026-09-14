@@ -6,6 +6,18 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-09-15
+
+### Fixed
+
+- **Large MCP turn responses remain valid JSON.** Quote-heavy and backslash-heavy
+  text can expand when JSON-encoded, exceeding the transport cap even when its
+  raw character count fits. Single-turn responses now retain the longest text
+  prefix that fits after serialization and set `clipped: true`, preserving the
+  schema, turn identity and original retained byte count. If metadata alone
+  exceeds the limit, window and turn responses return a small, parseable JSON
+  error instead of a success payload cut in the middle of a string.
+
 ## [0.27.0] - 2026-09-15
 
 ### Fixed

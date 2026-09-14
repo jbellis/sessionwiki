@@ -229,8 +229,9 @@ fn json_result(mut rows: Vec<Value>) -> Value {
 /// A single JSON OBJECT result (session_window / turn drill-down). Like
 /// [`json_result`] but for an object: if it would exceed the MCP text cap, drop
 /// the OLDEST kept turn (bumping `omitted_leading`) until it fits, so the output
-/// is always valid JSON and preserves the recent tail. An object with no `turns`
-/// array (a single-turn fetch) falls back to the char cap of [`text_result`].
+/// is always valid JSON and preserves the recent tail. A single-turn fetch is
+/// clipped by its serialized size, including JSON escapes and metadata. If the
+/// metadata alone cannot fit, return a bounded JSON error instead of broken JSON.
 fn object_result(mut v: Value) -> Value {
     loop {
         let s = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
@@ -251,7 +252,39 @@ fn object_result(mut v: Value) -> Value {
                 .unwrap_or(0);
             v["omitted_leading"] = json!(n + 1);
         } else {
-            return text_result(s, false);
+            if let Some(full) = v.get("text").and_then(Value::as_str).map(str::to_owned) {
+                // Neutralization has already run. Find the longest UTF-8 prefix
+                // whose complete JSON encoding fits, not a cut in serialized
+                // text: quotes, backslashes and newlines expand during encoding.
+                v["text"] = json!("");
+                v["clipped"] = json!(true);
+                let empty = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+                if empty.chars().count() <= 24_000 {
+                    let boundaries: Vec<usize> = full
+                        .char_indices()
+                        .map(|(offset, _)| offset)
+                        .chain(std::iter::once(full.len()))
+                        .collect();
+                    let (mut low, mut high) = (0, boundaries.len() - 1);
+                    while low < high {
+                        let mid = low + (high - low).div_ceil(2);
+                        v["text"] = json!(&full[..boundaries[mid]]);
+                        let encoded = serde_json::to_string(&v).unwrap_or_else(|_| "{}".into());
+                        if encoded.chars().count() <= 24_000 {
+                            low = mid;
+                        } else {
+                            high = mid - 1;
+                        }
+                    }
+                    v["text"] = json!(&full[..boundaries[low]]);
+                    continue;
+                }
+            }
+            return json!({
+                "content": [{"type": "text", "text":
+                    "{\"error\":\"session metadata exceeds the MCP output limit\"}"}],
+                "isError": true
+            });
         }
     }
 }
@@ -1052,6 +1085,59 @@ mod tests {
                 .is_some_and(|s| s.contains("[redacted:openai]")),
             "the full body must be redacted before the 23,000-char cap: {turn}"
         );
+    }
+
+    #[test]
+    fn turn_transport_caps_escaped_text_without_breaking_json() {
+        let _lock = LOCK.lock().unwrap();
+        let conn = seed("sessionwiki-test-mcp-turn-escaped-cap");
+        conn.execute(
+            "UPDATE files SET archived_at='2026-06-11T00:00:00Z' WHERE session_id='s1'",
+            [],
+        )
+        .unwrap();
+        for full in ["\"".repeat(22_999), "\\\n한글".repeat(5_000)] {
+            conn.execute(
+                "UPDATE messages SET text=?1 WHERE session_id='s1'",
+                params![full],
+            )
+            .unwrap();
+            let (response, encoded) = tool("session_window", json!({"id":"s1", "turn":0}));
+            assert_eq!(response["result"]["isError"], false);
+            let turn: Value =
+                serde_json::from_str(&encoded).expect("MCP turn text must remain valid JSON");
+            assert!(encoded.chars().count() <= 24_000);
+            assert_eq!(turn["schema"], crate::window::TURN_SCHEMA);
+            assert_eq!(turn["id"], "s1");
+            assert_eq!(turn["i"], 0);
+            assert_eq!(turn["role"], "user");
+            assert_eq!(turn["bytes"], full.len());
+            assert_eq!(turn["clipped"], true);
+            let retained = turn["text"].as_str().unwrap();
+            assert!(!retained.is_empty());
+            // MCP already normalizes newlines before applying the transport cap.
+            assert!(full.replace('\n', " ").starts_with(retained));
+            assert!(
+                encoded.chars().count() > 23_980,
+                "keep the largest prefix that fits"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_window_metadata_returns_a_parseable_error() {
+        let response = object_result(json!({
+            "schema": crate::window::WINDOW_SCHEMA,
+            "project": "x".repeat(30_000),
+            "omitted_leading": 0,
+            "turns": [{"i":0, "text":"tiny"}]
+        }));
+        let encoded = response["content"][0]["text"].as_str().unwrap();
+        let error: Value =
+            serde_json::from_str(encoded).expect("oversized metadata must not break JSON");
+        assert_eq!(response["isError"], true);
+        assert!(error["error"].as_str().unwrap().contains("metadata"));
+        assert!(encoded.chars().count() <= 24_000);
     }
 
     #[test]
