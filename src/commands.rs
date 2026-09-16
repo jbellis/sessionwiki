@@ -1005,6 +1005,18 @@ pub fn brief(
     Ok(())
 }
 
+/// Render a session as the same markdown briefing the `brief` command prints,
+/// without going through the command line. For programs that embed this crate
+/// as a library and show a briefing in their own interface. The source path is
+/// left out, since an embedder's paths mean nothing to its reader.
+pub fn brief_markdown(
+    session: &crate::model::Session,
+    max_chars: usize,
+    include_tools: bool,
+) -> String {
+    brief_text(session, max_chars, include_tools, false)
+}
+
 /// The markdown briefing used by `brief` and as LLM input for `summarize`.
 pub(crate) fn brief_text(
     session: &crate::model::Session,
@@ -1955,5 +1967,53 @@ mod tests {
         assert!(parse_duration("99999999999999999w").is_err());
         assert!(parse_duration("9999999999999999999999d").is_err()); // > i64 too
         assert!(parse_duration("99999999999999999m").is_err());
+    }
+
+    /// The library entry point an embedding program renders a briefing with:
+    /// the same markdown the CLI prints, minus the local Source path.
+    #[test]
+    fn brief_markdown_renders_a_session_without_its_source_path() {
+        use crate::model::{Message, Role, Session};
+        let session = Session {
+            id: "s1".into(),
+            tool: "mjolnir",
+            path: "/home/someone/data/sessions/s1".into(),
+            project: "/proj".into(),
+            started: None,
+            ended: None,
+            title: "fix the parser".into(),
+            subagent: false,
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    text: "fix the parser".into(),
+                    ts: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    text: "done, the parser is fixed".into(),
+                    ts: None,
+                },
+                Message {
+                    role: Role::Tool,
+                    text: "edit src/parse.rs".into(),
+                    ts: None,
+                },
+            ],
+            touched: vec![],
+            edits: vec![],
+        };
+
+        let md = brief_markdown(&session, 4000, true);
+        assert!(md.contains("**User:**\nfix the parser"));
+        assert!(md.contains("**Assistant:**\ndone, the parser is fixed"));
+        assert!(md.contains("> [tool] edit src/parse.rs"));
+        assert!(
+            !md.contains("/home/someone"),
+            "the local source path must stay out of an embedder's briefing"
+        );
+
+        let without_tools = brief_markdown(&session, 4000, false);
+        assert!(!without_tools.contains("[tool]"));
     }
 }
