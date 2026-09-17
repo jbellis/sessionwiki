@@ -774,20 +774,20 @@ fn is_harness_noise(text: &str) -> bool {
     t.starts_with('<') || t.starts_with("[Request interrupted")
 }
 
-/// Load a session for reading: re-parse the original file when it still exists
-/// (full fidelity), otherwise reconstruct it from the index. The latter is how
-/// archived sessions - those the tool deleted - stay readable.
+/// Load a session for reading: re-parse an existing original when this binary
+/// has its adapter (full fidelity). Otherwise read the indexed copy, including
+/// sessions supplied by an embedder whose adapter is not registered here.
 pub(crate) fn load_session(
     conn: &rusqlite::Connection,
     row: &index::SessionRow,
 ) -> Result<crate::model::Session> {
     let path = std::path::Path::new(&row.path);
     if path.exists() {
-        let adapter = adapters::by_name(&row.tool).context("unknown tool in index")?;
-        adapter.parse(path)
-    } else {
-        index::session_from_index(conn, row)
+        if let Some(adapter) = adapters::by_name(&row.tool) {
+            return adapter.parse(path);
+        }
     }
+    index::session_from_index(conn, row)
 }
 
 /// Redact every untrusted string carried by a parsed session before it crosses

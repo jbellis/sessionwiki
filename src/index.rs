@@ -662,6 +662,8 @@ pub fn sync_bounded(
 /// Like [`sync_bounded`], but over an explicit adapter list instead of the
 /// built-in registry. A program that embeds this crate as a library can index
 /// its own sessions by passing its own [`Adapter`] alongside `adapters::all()`.
+/// Readers without that adapter use the indexed transcript; call this again
+/// to make later changes to those sessions visible to the standalone binary.
 pub fn sync_with(
     conn: &mut Connection,
     adapters: &[Box<dyn Adapter>],
@@ -1938,10 +1940,6 @@ fn to_epoch(s: &str) -> Option<i64> {
 
 // --- archive: serving and forgetting sessions whose originals are gone ---
 
-/// Reconstruct a `Session` from the index alone, for sessions whose original
-/// file the tool deleted (archive mode). It carries the distilled transcript
-/// we kept - the same text `show`/`brief` would display for a live session,
-/// minus per-message timestamps and full tool I/O, which were never indexed.
 /// The display name for a tool this binary's adapter registry does not know.
 ///
 /// A program that embeds this crate can register its own adapters, so rows in
@@ -1966,6 +1964,9 @@ fn interned_tool(name: &str) -> &'static str {
     leaked
 }
 
+/// Reconstruct an archived or external-adapter session from its indexed copy.
+/// This retained transcript omits per-message timestamps and full tool I/O,
+/// which were never indexed.
 pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::model::Session> {
     use crate::model::{Message, Role};
     let mut stmt =
