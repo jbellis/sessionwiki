@@ -94,6 +94,17 @@ pub trait Adapter {
     fn parse_key(&self, _key: &str) -> Result<Session> {
         anyhow::bail!("this adapter is not a shared store")
     }
+    /// Limit deletion reconciliation to part of this tool's indexed rows. When
+    /// `Some(prefix)`, only indexed rows whose key starts with `prefix` are
+    /// considered for archiving after this adapter runs. Use it when the
+    /// adapter's store holds only part of a tool's sessions - for example
+    /// several installations of the same tool sharing one tool name, each
+    /// listing only its own keys - so that one installation's sync cannot
+    /// archive another's rows. Default `None` = the adapter speaks for every
+    /// row of its tool.
+    fn reconcile_scope(&self) -> Option<String> {
+        None
+    }
 }
 
 pub fn all() -> Vec<Box<dyn Adapter>> {

@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 /// Where a legacy index would sit, given where this one is going.
@@ -656,7 +656,24 @@ pub fn sync_bounded(
         Some(t) => adapters::by_name(t).into_iter().collect(),
         None => adapters::all(),
     };
+    sync_with(conn, &adapters, since)
+}
 
+/// Like [`sync_bounded`], but over an explicit adapter list instead of the
+/// built-in registry. A program that embeds this crate as a library can index
+/// its own sessions by passing its own [`Adapter`] alongside `adapters::all()`.
+/// Readers without that adapter use the indexed transcript; call this again
+/// to make later changes to those sessions visible to the standalone binary.
+pub fn sync_with(
+    conn: &mut Connection,
+    adapters: &[Box<dyn Adapter>],
+    since: Option<i64>,
+) -> Result<()> {
+    // Per-session progress redraws one line with `\r`, which only means
+    // anything on a terminal. Redirected into a log it becomes a single line
+    // megabytes long, so decide once per sync and skip those writes when stderr
+    // is not a terminal. Warnings and the per-tool summary still print.
+    let progress = std::io::stderr().is_terminal();
     let mut known: HashMap<String, (i64, i64)> = HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT path, mtime, size FROM files")?;
@@ -673,7 +690,7 @@ pub fn sync_bounded(
     }
 
     let mut archived_total = 0usize;
-    for adapter in &adapters {
+    for adapter in adapters {
         // `store_present` tells "the tool pruned some sessions" (root exists,
         // those gone) apart from "the whole store vanished" (uninstall,
         // unmounted) - we must not mass-archive on the latter.
@@ -708,7 +725,13 @@ pub fn sync_bounded(
                      skipping deletion reconciliation this run"
                 );
             } else {
-                archived_total += archive_or_prune(conn, tool, &seen, store_present)?;
+                archived_total += archive_or_prune(
+                    conn,
+                    tool,
+                    &seen,
+                    store_present,
+                    adapter.reconcile_scope().as_deref(),
+                )?;
             }
 
             if !pending.is_empty() {
@@ -718,8 +741,10 @@ pub fn sync_bounded(
                 let mut failed = 0usize;
                 let tx = conn.transaction()?;
                 for (i, key) in pending.iter().enumerate() {
-                    eprint!("\r[{tool}] indexing {}/{total}", i + 1);
-                    std::io::stderr().flush().ok();
+                    if progress {
+                        eprint!("\r[{tool}] indexing {}/{total}", i + 1);
+                        std::io::stderr().flush().ok();
+                    }
                     // A failed parse is warned, not silently dropped: the user
                     // must know a session is missing from the corpus.
                     let session = match adapter.parse_key(key) {
@@ -779,7 +804,13 @@ pub fn sync_bounded(
                  skipping deletion reconciliation this run"
             );
         } else {
-            archived_total += archive_or_prune(conn, tool, &seen, store_present)?;
+            archived_total += archive_or_prune(
+                conn,
+                tool,
+                &seen,
+                store_present,
+                adapter.reconcile_scope().as_deref(),
+            )?;
         }
 
         if pending.is_empty() {
@@ -791,8 +822,10 @@ pub fn sync_bounded(
         let tx = conn.transaction()?;
         for (path, mtime, size) in pending {
             done += 1;
-            eprint!("\r[{tool}] indexing {done}/{total}");
-            std::io::stderr().flush().ok();
+            if progress {
+                eprint!("\r[{tool}] indexing {done}/{total}");
+                std::io::stderr().flush().ok();
+            }
 
             // A failed parse is warned, not silently dropped: the user must
             // know a session is missing from the corpus.
@@ -870,15 +903,26 @@ fn archive_or_prune(
     tool: &str,
     seen: &[String],
     store_present: bool,
+    scope: Option<&str>,
 ) -> Result<usize> {
     let no_archive = std::env::var_os("SESSIONWIKI_NO_ARCHIVE").is_some();
-    let seen_set: std::collections::HashSet<&str> = seen.iter().map(String::as_str).collect();
+    // A scoped adapter speaks only for the keys under its prefix; everything
+    // else under the same tool name belongs to another store and must be left
+    // alone. Filtering happens in Rust, not with SQL `LIKE`: keys are paths and
+    // `_` is a LIKE wildcard.
+    let in_scope = |key: &str| scope.is_none_or(|p| key.starts_with(p));
+    let seen_set: std::collections::HashSet<&str> = seen
+        .iter()
+        .map(String::as_str)
+        .filter(|k| in_scope(k))
+        .collect();
 
     let mut stmt =
         conn.prepare("SELECT path, session_id FROM files WHERE tool = ?1 AND archived_at IS NULL")?;
-    let live: Vec<(String, String)> = stmt
+    let all_live: Vec<(String, String)> = stmt
         .query_map(params![tool], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let live: Vec<(String, String)> = all_live.into_iter().filter(|(p, _)| in_scope(p)).collect();
     let gone: Vec<(String, String)> = live
         .into_iter()
         .filter(|(p, _)| !seen_set.contains(p.as_str()))
@@ -897,7 +941,7 @@ fn archive_or_prune(
     // sessions: could be a legitimate prune-everything, but also a transient
     // read failure (permissions, a half-mounted network FS). Archiving keeps
     // the data (reversible on the next good sync), but say so loudly.
-    if seen.is_empty() {
+    if seen_set.is_empty() {
         eprintln!(
             "[{tool}] no sessions found on disk but {} were indexed - archiving them; \
              if the store is just unreadable right now, they will un-archive on the next sync",
@@ -1896,10 +1940,33 @@ fn to_epoch(s: &str) -> Option<i64> {
 
 // --- archive: serving and forgetting sessions whose originals are gone ---
 
-/// Reconstruct a `Session` from the index alone, for sessions whose original
-/// file the tool deleted (archive mode). It carries the distilled transcript
-/// we kept - the same text `show`/`brief` would display for a live session,
-/// minus per-message timestamps and full tool I/O, which were never indexed.
+/// The display name for a tool this binary's adapter registry does not know.
+///
+/// A program that embeds this crate can register its own adapters, so rows in
+/// the index may name a tool the standalone binary has never heard of. Those
+/// rows used to print as "unknown". `Session.tool` is `&'static str`, so the
+/// row's own string has to outlive the call: intern it once and leak it. The
+/// set of tool names is small and fixed by the tools a user actually runs, so
+/// the leak is bounded by that, not by the number of sessions.
+fn interned_tool(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
+/// Reconstruct an archived or external-adapter session from its indexed copy.
+/// This retained transcript omits per-message timestamps and full tool I/O,
+/// which were never indexed.
 pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::model::Session> {
     use crate::model::{Message, Role};
     let mut stmt =
@@ -1923,7 +1990,7 @@ pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::
 
     let tool = adapters::by_name(&row.tool)
         .map(|a| a.name())
-        .unwrap_or("unknown");
+        .unwrap_or_else(|| interned_tool(&row.tool));
     let started = row
         .started
         .as_deref()
@@ -2732,5 +2799,189 @@ mod legacy_migration_tests {
     #[test]
     fn a_destination_with_no_parent_offers_nothing_to_migrate() {
         assert!(legacy_candidates(std::path::Path::new("/")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod embedder_hook_tests {
+    use super::*;
+    use crate::adapters::{Adapter, Discovered, Store};
+    use crate::model::{Message, Role, Session};
+    use std::path::Path;
+
+    /// A shared-store adapter an embedding program could supply: it lists only
+    /// the keys under its own prefix and reconciles only that prefix.
+    struct FakeStore {
+        keys: Vec<(String, i64)>,
+        scope: Option<String>,
+    }
+
+    impl Adapter for FakeStore {
+        fn name(&self) -> &'static str {
+            "mjolnir"
+        }
+        fn root(&self) -> Option<PathBuf> {
+            // Any existing directory: the reconciliation guard only asks
+            // whether the store root is still there.
+            Some(std::env::current_dir().unwrap())
+        }
+        fn discover(&self) -> Discovered {
+            Discovered {
+                files: Vec::new(),
+                had_error: false,
+            }
+        }
+        fn parse(&self, _path: &Path) -> Result<Session> {
+            anyhow::bail!("shared store")
+        }
+        fn store(&self) -> Option<Store> {
+            Some(Store {
+                keys: self.keys.clone(),
+                files: Vec::new(),
+                had_error: false,
+            })
+        }
+        fn parse_key(&self, key: &str) -> Result<Session> {
+            Ok(Session {
+                id: key.rsplit('/').next().unwrap().to_string(),
+                tool: "mjolnir",
+                path: PathBuf::from(key),
+                project: "/proj".into(),
+                started: None,
+                ended: None,
+                title: "a restored session".into(),
+                subagent: false,
+                messages: vec![Message {
+                    role: Role::User,
+                    text: "make the tests green".into(),
+                    ts: None,
+                }],
+                touched: vec![],
+                edits: vec![],
+            })
+        }
+        fn reconcile_scope(&self) -> Option<String> {
+            self.scope.clone()
+        }
+    }
+
+    fn insert_live_row(c: &Connection, path: &str, sid: &str) {
+        c.execute(
+            "INSERT INTO files(path, session_id, tool, mtime, size, project, title, msg_count, kind)
+             VALUES(?1, ?2, 'mjolnir', 0, 0, '/proj', 't', 1, 'session')",
+            params![path, sid],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO messages(session_id, role, text) VALUES(?1,'user','hello')",
+            params![sid],
+        )
+        .unwrap();
+    }
+
+    fn archived_at(c: &Connection, path: &str) -> Option<String> {
+        c.query_row(
+            "SELECT archived_at FROM files WHERE path = ?1",
+            params![path],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Two installations of one tool share a tool name and one index. A sync
+    /// driven by the first must not archive the second's rows just because it
+    /// never lists them.
+    #[test]
+    fn reconcile_scope_limits_archiving_to_the_adapters_own_keys() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+        insert_live_row(&c, "/data/one/sess-a", "sa");
+        insert_live_row(&c, "/data/two/sess-b", "sb");
+
+        let adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FakeStore {
+            keys: Vec::new(),
+            scope: Some("/data/one/".to_string()),
+        })];
+        sync_with(&mut c, &adapters, None).unwrap();
+
+        assert!(
+            archived_at(&c, "/data/one/sess-a").is_some(),
+            "the in-scope row the adapter no longer lists must be archived"
+        );
+        assert!(
+            archived_at(&c, "/data/two/sess-b").is_none(),
+            "the other installation's row must be left live"
+        );
+    }
+
+    /// Without a scope the adapter still speaks for every row of its tool.
+    #[test]
+    fn an_unscoped_adapter_still_archives_every_row_of_its_tool() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+        insert_live_row(&c, "/data/one/sess-a", "sa");
+        insert_live_row(&c, "/data/two/sess-b", "sb");
+
+        let adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FakeStore {
+            keys: Vec::new(),
+            scope: None,
+        })];
+        sync_with(&mut c, &adapters, None).unwrap();
+
+        assert!(archived_at(&c, "/data/one/sess-a").is_some());
+        assert!(archived_at(&c, "/data/two/sess-b").is_some());
+    }
+
+    /// The point of `sync_with`: an embedding program indexes its own sessions
+    /// with its own adapter, which is in no built-in registry.
+    #[test]
+    fn sync_with_indexes_a_session_from_a_supplied_adapter() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+
+        let adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FakeStore {
+            keys: vec![("/data/one/sess-a".to_string(), 42)],
+            scope: Some("/data/one/".to_string()),
+        })];
+        sync_with(&mut c, &adapters, None).unwrap();
+
+        let rows = recent(&c, 10, Some("mjolnir"), None, None, false).unwrap();
+        assert_eq!(rows.len(), 1, "the supplied adapter's session was indexed");
+        assert_eq!(rows[0].session_id, "sess-a");
+        assert_eq!(rows[0].title, "a restored session");
+        assert_eq!(rows[0].msg_count, 1);
+        assert!(!rows[0].archived, "a listed session stays live");
+    }
+
+    /// A row whose tool only an embedder's adapter knows still shows that
+    /// tool's name, rather than the "unknown" the registry lookup used to give.
+    #[test]
+    fn a_session_keeps_its_own_tool_name_when_no_adapter_is_registered() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+
+        let adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FakeStore {
+            keys: vec![("/data/one/sess-a".to_string(), 42)],
+            scope: Some("/data/one/".to_string()),
+        })];
+        sync_with(&mut c, &adapters, None).unwrap();
+
+        let rows = recent(&c, 10, Some("mjolnir"), None, None, false).unwrap();
+        assert!(
+            crate::adapters::by_name("mjolnir").is_none(),
+            "the built-in registry must not know this tool, or the test proves nothing"
+        );
+        let session = session_from_index(&c, &rows[0]).unwrap();
+        assert_eq!(session.tool, "mjolnir");
+    }
+
+    /// The interner hands back one leaked string per name, however often it is
+    /// asked, so the leak is bounded by the number of tool names.
+    #[test]
+    fn interning_a_tool_name_twice_yields_the_same_string() {
+        let first = interned_tool("a-tool-no-adapter-knows");
+        let second = interned_tool(&String::from("a-tool-no-adapter-knows"));
+        assert_eq!(first, "a-tool-no-adapter-knows");
+        assert!(std::ptr::eq(first, second));
     }
 }
