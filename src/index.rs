@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 /// Where a legacy index would sit, given where this one is going.
@@ -667,6 +667,11 @@ pub fn sync_with(
     adapters: &[Box<dyn Adapter>],
     since: Option<i64>,
 ) -> Result<()> {
+    // Per-session progress redraws one line with `\r`, which only means
+    // anything on a terminal. Redirected into a log it becomes a single line
+    // megabytes long, so decide once per sync and skip those writes when stderr
+    // is not a terminal. Warnings and the per-tool summary still print.
+    let progress = std::io::stderr().is_terminal();
     let mut known: HashMap<String, (i64, i64)> = HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT path, mtime, size FROM files")?;
@@ -734,8 +739,10 @@ pub fn sync_with(
                 let mut failed = 0usize;
                 let tx = conn.transaction()?;
                 for (i, key) in pending.iter().enumerate() {
-                    eprint!("\r[{tool}] indexing {}/{total}", i + 1);
-                    std::io::stderr().flush().ok();
+                    if progress {
+                        eprint!("\r[{tool}] indexing {}/{total}", i + 1);
+                        std::io::stderr().flush().ok();
+                    }
                     // A failed parse is warned, not silently dropped: the user
                     // must know a session is missing from the corpus.
                     let session = match adapter.parse_key(key) {
@@ -813,8 +820,10 @@ pub fn sync_with(
         let tx = conn.transaction()?;
         for (path, mtime, size) in pending {
             done += 1;
-            eprint!("\r[{tool}] indexing {done}/{total}");
-            std::io::stderr().flush().ok();
+            if progress {
+                eprint!("\r[{tool}] indexing {done}/{total}");
+                std::io::stderr().flush().ok();
+            }
 
             // A failed parse is warned, not silently dropped: the user must
             // know a session is missing from the corpus.
@@ -1933,6 +1942,30 @@ fn to_epoch(s: &str) -> Option<i64> {
 /// file the tool deleted (archive mode). It carries the distilled transcript
 /// we kept - the same text `show`/`brief` would display for a live session,
 /// minus per-message timestamps and full tool I/O, which were never indexed.
+/// The display name for a tool this binary's adapter registry does not know.
+///
+/// A program that embeds this crate can register its own adapters, so rows in
+/// the index may name a tool the standalone binary has never heard of. Those
+/// rows used to print as "unknown". `Session.tool` is `&'static str`, so the
+/// row's own string has to outlive the call: intern it once and leak it. The
+/// set of tool names is small and fixed by the tools a user actually runs, so
+/// the leak is bounded by that, not by the number of sessions.
+fn interned_tool(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = names.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
 pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::model::Session> {
     use crate::model::{Message, Role};
     let mut stmt =
@@ -1956,7 +1989,7 @@ pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::
 
     let tool = adapters::by_name(&row.tool)
         .map(|a| a.name())
-        .unwrap_or("unknown");
+        .unwrap_or_else(|| interned_tool(&row.tool));
     let started = row
         .started
         .as_deref()
@@ -2917,5 +2950,37 @@ mod embedder_hook_tests {
         assert_eq!(rows[0].title, "a restored session");
         assert_eq!(rows[0].msg_count, 1);
         assert!(!rows[0].archived, "a listed session stays live");
+    }
+
+    /// A row whose tool only an embedder's adapter knows still shows that
+    /// tool's name, rather than the "unknown" the registry lookup used to give.
+    #[test]
+    fn a_session_keeps_its_own_tool_name_when_no_adapter_is_registered() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+
+        let adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FakeStore {
+            keys: vec![("/data/one/sess-a".to_string(), 42)],
+            scope: Some("/data/one/".to_string()),
+        })];
+        sync_with(&mut c, &adapters, None).unwrap();
+
+        let rows = recent(&c, 10, Some("mjolnir"), None, None, false).unwrap();
+        assert!(
+            crate::adapters::by_name("mjolnir").is_none(),
+            "the built-in registry must not know this tool, or the test proves nothing"
+        );
+        let session = session_from_index(&c, &rows[0]).unwrap();
+        assert_eq!(session.tool, "mjolnir");
+    }
+
+    /// The interner hands back one leaked string per name, however often it is
+    /// asked, so the leak is bounded by the number of tool names.
+    #[test]
+    fn interning_a_tool_name_twice_yields_the_same_string() {
+        let first = interned_tool("a-tool-no-adapter-knows");
+        let second = interned_tool(&String::from("a-tool-no-adapter-knows"));
+        assert_eq!(first, "a-tool-no-adapter-knows");
+        assert!(std::ptr::eq(first, second));
     }
 }
