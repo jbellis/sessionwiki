@@ -6,6 +6,8 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-09-17
+
 ### Added
 
 - Embedders can index custom adapters with `index::sync_with`, restrict deletion
@@ -23,6 +25,16 @@ semantic versioning once it reaches 1.0.
   reader as the CLI and MCP.
 - Redirected synchronization logs omit terminal-only progress redraws while
   retaining warnings and per-tool summaries.
+
+### Maintenance
+
+- CI and the dependency auto-merge gate use `actions/setup-python` v7 with
+  the existing Python 3.12 configuration.
+
+Implementation and validation: [PR #26](https://github.com/youdie006/sessionwiki/pull/26)
+and [PR #27](https://github.com/youdie006/sessionwiki/pull/27). Publication and
+installation verification are recorded in the
+[0.29.0 release](https://github.com/youdie006/sessionwiki/releases/tag/v0.29.0).
 
 ## [0.28.0] - 2026-09-15
 
