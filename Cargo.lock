@@ -95,6 +95,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-sessionwiki"
+version = "0.28.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tiny_http",
+ "unicode-normalization",
+ "walkdir",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,24 +653,6 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
-]
-
-[[package]]
-name = "sessionwiki"
-version = "0.28.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "dirs",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tiny_http",
- "unicode-normalization",
- "walkdir",
 ]
 
 [[package]]
