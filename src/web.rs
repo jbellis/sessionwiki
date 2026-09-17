@@ -1,4 +1,4 @@
-use crate::{adapters, index, resume};
+use crate::{commands, index, resume};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::json;
@@ -258,14 +258,7 @@ fn api_session(conn: &Connection, id: &str) -> Result<Boxed> {
     let matches = index::resolve(conn, id)?;
     let row = matches.first().context("session not found")?;
     let path = std::path::Path::new(&row.path);
-    // Archived sessions (original deleted by the tool) are served from the
-    // index; live ones are re-parsed from the file for full fidelity.
-    let session = if path.exists() {
-        let adapter = adapters::by_name(&row.tool).context("unknown tool")?;
-        adapter.parse(path)?
-    } else {
-        index::session_from_index(conn, row)?
-    };
+    let session = commands::load_session(conn, row)?;
     let mut v = serde_json::to_value(&session)?;
     if row.archived {
         v["archived"] = json!(true);
