@@ -6,6 +6,24 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Embedders can index custom adapters with `index::sync_with`, restrict deletion
+  reconciliation to their own keys with `Adapter::reconcile_scope`, and render
+  a redacted briefing without its source path with `commands::brief_markdown`.
+  Custom tool names are preserved when reading sessions from the index.
+
+### Fixed
+
+- Sessions indexed by an external adapter stay readable in `show`, `brief`, MCP
+  and the web viewer while their source files still exist. Readers without the
+  adapter use the indexed transcript instead of failing with `unknown tool`;
+  the embedder must sync again to publish later changes. Built-in adapters still
+  reparse live files and report parse errors. The web viewer now shares the same
+  reader as the CLI and MCP.
+- Redirected synchronization logs omit terminal-only progress redraws while
+  retaining warnings and per-tool summaries.
+
 ## [0.28.0] - 2026-09-15
 
 ### Fixed
