@@ -1,6 +1,6 @@
 [package]
 name = "brokk-sessionwiki"
-version = "0.30.0"
+version = "0.30.1"
 edition = "2021"
 description = "Find, search, and read every AI coding session you've ever had - across Claude Code, Codex, Gemini CLI, OpenCode, Cline, and more."
 license = "MIT"
@@ -26,6 +26,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "sessionwiki"
 path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dependencies]
 anyhow = "1"

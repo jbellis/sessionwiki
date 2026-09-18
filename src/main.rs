@@ -365,6 +365,7 @@ enum HookCmd {
 }
 
 fn main() {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Scan => commands::scan(),
@@ -556,4 +557,18 @@ fn parse_line_range(s: &str) -> Result<(usize, usize), String> {
         return Err("require 1 <= START <= END".into());
     }
     Ok((start, end))
+}
+
+/// Let a closed pipe end the process quietly.
+///
+/// The Rust runtime ignores SIGPIPE before `main`, so writing to a pipe whose
+/// reader has gone (`sessionwiki grep -l ... | head`) fails with EPIPE and
+/// `println!` panics. Restoring the default disposition makes the process exit
+/// on the signal the way grep and cat do, with nothing on stderr.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: setting a signal disposition before any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
