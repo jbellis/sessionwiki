@@ -64,6 +64,59 @@ enum Command {
         #[arg(long)]
         no_sync: bool,
     },
+    /// Find matching messages inside sessions (sessions are files, messages
+    /// are lines)
+    ///
+    /// The pattern is a fixed string, not a regular expression, and matching is
+    /// always case-insensitive: this is what the trigram full-text index can
+    /// answer. Without ids, the sessions searched are the index's own top
+    /// matches; with ids, exactly those sessions.
+    Grep {
+        /// Text to look for (fixed string, case-insensitive substring)
+        pattern: String,
+        /// Sessions to search (id prefix is enough); omit to search the index
+        #[arg(value_name = "ID")]
+        ids: Vec<String>,
+        /// Max sessions to search when no ids are given
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// Filter by tool (claude-code, codex, gemini, prodex, ... - `scan` lists all)
+        #[arg(long)]
+        tool: Option<String>,
+        /// Filter by project path substring
+        #[arg(long)]
+        project: Option<String>,
+        /// Only sessions started within this window (7d, 2w, 24h, 90m)
+        #[arg(long)]
+        since: Option<String>,
+        /// Stop after this many matching messages per session
+        #[arg(short = 'm', long = "max-count", value_name = "N")]
+        max_matches: Option<usize>,
+        /// Messages of context after a match
+        #[arg(short = 'A', value_name = "N", default_value_t = 0)]
+        after: usize,
+        /// Messages of context before a match
+        #[arg(short = 'B', value_name = "N", default_value_t = 0)]
+        before: usize,
+        /// Messages of context on both sides (sets -A and -B)
+        #[arg(short = 'C', value_name = "N")]
+        context: Option<usize>,
+        /// Characters kept per message, windowed around its first match (0 keeps all)
+        #[arg(long, default_value_t = 240)]
+        chars: usize,
+        /// Print only the ids of sessions that matched
+        #[arg(short = 'l', long = "files-with-matches")]
+        list: bool,
+        /// Print `id:count` per session instead of the matching messages
+        #[arg(short = 'c', long = "count")]
+        count: bool,
+        /// Emit one JSON object per line: {id, i, role, ts, text, matches, omitted_before}
+        #[arg(long)]
+        json: bool,
+        /// Skip the index sync and query what is already indexed (pair with `sync`)
+        #[arg(long)]
+        no_sync: bool,
+    },
     /// Recall past work in one step: search, then brief the top match
     Recall {
         /// What to recall - a topic, error text, or identifier (exact phrasing)
@@ -110,6 +163,9 @@ enum Command {
         /// Emit the parsed session as JSON
         #[arg(long)]
         json: bool,
+        /// Emit one JSON object per message per line: {i, role, ts, text}
+        #[arg(long, conflicts_with = "json")]
+        jsonl: bool,
         /// Show a digest instead: every user turn plus how the session ended
         #[arg(long)]
         outline: bool,
@@ -348,6 +404,41 @@ fn main() {
             json,
             no_sync,
         ),
+        Command::Grep {
+            pattern,
+            ids,
+            limit,
+            tool,
+            project,
+            since,
+            max_matches,
+            after,
+            before,
+            context,
+            chars,
+            list,
+            count,
+            json,
+            no_sync,
+        } => commands::grep(
+            &pattern,
+            &commands::GrepArgs {
+                ids: &ids,
+                limit,
+                tool: tool.as_deref(),
+                project: project.as_deref(),
+                since: since.as_deref(),
+                max_matches,
+                // The library keeps one symmetric context width, so a lopsided
+                // -A/-B widens to the larger of the two.
+                context: context.unwrap_or_else(|| after.max(before)),
+                chars,
+                list,
+                count,
+                json,
+                no_sync,
+            },
+        ),
         Command::Recall {
             query,
             limit,
@@ -374,12 +465,15 @@ fn main() {
             id,
             full,
             json,
+            jsonl,
             outline,
             window,
             budget,
             live,
             no_sync,
-        } => commands::show(&id, full, json, outline, window, budget, live, no_sync),
+        } => commands::show(
+            &id, full, json, jsonl, outline, window, budget, live, no_sync,
+        ),
         Command::Resume { id, print, no_sync } => commands::resume_cmd(&id, print, no_sync),
         Command::Migrate {
             id,

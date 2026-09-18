@@ -4,7 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning once it reaches 1.0.
 
-## [Unreleased]
+## [0.30.0] - 2026-09-18
+
+### Added
+
+- **`grep`: find the matching messages inside sessions.** `search` finds the
+  session; `grep <pattern> [<id>...]` finds where in it, with sessions as the
+  files and messages as the lines. Without ids it greps the index's top
+  matches (`-n`, `--tool`, `--project`, `--since`); with ids it greps exactly
+  those sessions. Familiar flags: `-l`, `-c`, `-m`, `-A`/`-B`/`-C`, plus
+  `--chars` for the per-message window and `--json` for one JSON object per
+  hit. The pattern is a fixed string and matching is always case-insensitive,
+  which is what the trigram index can answer; `--help` says so.
+- **`show --jsonl`**: one JSON object per message per line
+  (`{i, role, ts, text}`), for line-oriented tools and agents. Like `--json`
+  it is the raw reader.
+- **`search --json` reports `i`**, the position within the session of the
+  best-matching message, so a caller can jump straight to it.
+- **`grep::grep_session` in the library**: the passages of one loaded session
+  that match a pattern, with context messages, per-message windowing, a match
+  cap and a choice of which roles may anchor a hit. This is what the `grep`
+  command is built on, and what an embedding program can reuse.
 
 ## [0.29.0] - 2026-09-17
 
