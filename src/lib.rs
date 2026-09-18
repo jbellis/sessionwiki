@@ -11,6 +11,7 @@ pub mod adapters;
 pub mod blame;
 pub mod commands;
 pub mod doctor;
+pub mod grep;
 pub mod hook;
 pub mod index;
 pub mod mcp;

@@ -191,6 +191,38 @@ fn search_hit_serializes_with_snippet_and_role() {
     assert!(v["tags"].is_null());
 }
 
+/// A hit reports the matching message's position within its session, so a
+/// caller can jump straight to it with `show --jsonl`. Messages have no
+/// ordinal column; the position is `id` order within the session.
+#[test]
+fn search_hit_reports_the_message_index() {
+    let _g = LOCK.lock().unwrap();
+    let conn = fresh();
+    seed(&conn, "s9"); // one message already, so the next is index 1
+    for text in ["first message", "second has haystack", "third message"] {
+        conn.execute(
+            "INSERT INTO messages(session_id, role, text) VALUES ('s9','user',?1)",
+            params![text],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO msgs(rowid, text) VALUES (?1,?2)",
+            params![id, text],
+        )
+        .unwrap();
+    }
+
+    let hits = index::search(&conn, "haystack", 10, None, None).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].i, 2, "the FTS path counts preceding messages");
+
+    // Under 3 chars the LIKE path runs instead; it reports the same position.
+    let like = index::search_like(&conn, "ha", 10, None, None).unwrap();
+    assert_eq!(like.len(), 1);
+    assert_eq!(like[0].i, 2);
+}
+
 #[test]
 fn brief_json_object_shape() {
     let _g = LOCK.lock().unwrap();

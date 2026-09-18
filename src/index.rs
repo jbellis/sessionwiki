@@ -1216,6 +1216,9 @@ pub struct Hit {
     pub row: SessionRow,
     pub role: String,
     pub snippet: String,
+    /// Index of the best-matching message within its session (0-based, in the
+    /// order `show` prints them). Lets a caller jump straight to the passage.
+    pub i: usize,
 }
 
 /// Full-text search, best match per session. The trigram tokenizer gives
@@ -1242,7 +1245,8 @@ pub fn search(
     // multi-million-message index. Narrow the query to surface the long tail.
     let mut sql = String::from(
         "SELECT f.session_id, f.tool, f.path, f.project, f.title, f.started, f.msg_count, f.kind,
-                m.role, x.snip, min(x.rank) AS best, (f.archived_at IS NOT NULL)
+                m.role, x.snip, min(x.rank) AS best, (f.archived_at IS NOT NULL),
+                m.id AS mid
          FROM (SELECT rowid AS mid,
                       snippet(msgs, 0, char(2), char(3), char(8230), 18) AS snip,
                       rank
@@ -1260,9 +1264,17 @@ pub fn search(
         sql.push_str(" AND f.project LIKE ?");
         args.push(format!("%{}%", crate::util::nfc(p)));
     }
-    sql.push_str(&format!(
-        " GROUP BY f.session_id ORDER BY best LIMIT {limit}"
-    ));
+    sql.push_str(" GROUP BY f.session_id");
+    // The message's position in its session. `messages` has no ordinal column,
+    // so per-session order is `id` order and the position is how many of that
+    // session's messages precede it. Counting outside the grouped query keeps
+    // the FTS match in the plain context snippet()/rank need.
+    let sql = format!(
+        "SELECT g.*,
+                (SELECT COUNT(*) FROM messages m2
+                  WHERE m2.session_id = g.session_id AND m2.id < g.mid) AS i
+         FROM ({sql}) g ORDER BY g.best LIMIT {limit}"
+    );
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
@@ -1284,6 +1296,7 @@ pub fn search(
             },
             role: r.get(8)?,
             snippet: r.get(9)?,
+            i: r.get::<_, i64>(13)?.max(0) as usize,
         })
     })?;
     let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1324,7 +1337,7 @@ pub fn search_like(
 
     let mut sql = String::from(
         "SELECT f.session_id, f.tool, f.path, f.project, f.title, f.started, f.msg_count, f.kind,
-                x.role, x.text, (f.archived_at IS NOT NULL)
+                x.role, x.text, (f.archived_at IS NOT NULL), max(x.mid) AS mid
          FROM (SELECT m.session_id AS sid, m.role AS role, m.text AS text, m.id AS mid
                FROM messages m
                WHERE m.text LIKE ?1 ESCAPE '\\'
@@ -1342,9 +1355,16 @@ pub fn search_like(
         args.push(Box::new(format!("%{}%", crate::util::nfc(p))));
     }
     // One row per session (its newest matching message), sessions newest-first.
-    sql.push_str(&format!(
-        " GROUP BY f.session_id ORDER BY max(x.mid) DESC LIMIT {limit}"
-    ));
+    // `max(x.mid)` is the only aggregate, so the bare columns come from that
+    // same newest matching message. The outer query turns its id into the
+    // message's position within the session (see `search`).
+    sql.push_str(" GROUP BY f.session_id");
+    let sql = format!(
+        "SELECT g.*,
+                (SELECT COUNT(*) FROM messages m2
+                  WHERE m2.session_id = g.session_id AND m2.id < g.mid) AS i
+         FROM ({sql}) g ORDER BY g.mid DESC LIMIT {limit}"
+    );
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -1370,6 +1390,7 @@ pub fn search_like(
                 },
                 role,
                 snippet: snippet_around(&text, &q),
+                i: r.get::<_, i64>(12)?.max(0) as usize,
             })
         },
     )?;

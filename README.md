@@ -140,8 +140,9 @@ GB). After that, updates are incremental and take seconds.
 | `scan` | Discover session stores on this machine. Pure filesystem walk, instant. |
 | `list` | Recent sessions across all tools in one timeline. `--tool codex`, `--project api`, `--tag spike`, `-n 50`, `--all` (include subagent transcripts). |
 | `search <query>` | Full-text search over every message of every tool. Minimum 3 characters. |
+| `grep <pattern> [<id>...]` | Find the matching *messages* inside sessions: sessions are the files, messages are the lines. The pattern is a fixed string and matching is always case-insensitive &mdash; that is what the trigram index can answer, so there is no regex and no `-i`. Without ids it greps the index's top matches (`-n`, `--tool`, `--project`, `--since 7d`); with ids it greps exactly those sessions. `-l` ids only, `-c` counts, `-m N` max matching messages per session, `-A`/`-B`/`-C` context messages, `--chars N` per-message window, `--json` for one JSON object per hit. See [below](#grep-inside-sessions). |
 | `recall <query>` | Search, list the matches, and brief the top one in a single command &mdash; the fastest way back into a past session. `--tool`, `--project`, `-n`, `--json` (for agents). |
-| `show <id>` | One session as a readable transcript. `--full` expands tool calls, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
+| `show <id>` | One session as a readable transcript. `--full` expands tool calls, `--json` emits the parsed session, `--jsonl` emits one JSON object per message (`{i, role, ts, text}`) for line-oriented tools and agents, `--outline` prints a digest: every question you asked plus how it ended. |
 | `summarize [id]` | 1&ndash;2 sentence synopses via **your own LLM CLI** (`claude -p` default; `--cmd` / `SESSIONWIKI_SUMMARIZER` to change), cached in the index and shown in `show`, `--outline`, and the web sidebar. Without an id, batches the `--recent N` newest. |
 | `resume <id>` | Reopen the session in its original tool: `claude --resume` / `codex resume`, run in the right project directory. Subagent transcripts resume their parent. `--print` to just show the command. |
 | `migrate <id> <dir>` | Make a session resumable from a different project directory: Claude Code copies the transcript into `<dir>`'s store, Codex resumes by id from anywhere, Gemini copies the chat over. The original is never touched. `--config-dir <DIR>` writes into a specific store instead of the default one - for a machine where each account has its own (`CLAUDE_CONFIG_DIR` is honoured when the flag is absent). |
@@ -171,6 +172,32 @@ a navigable, maintained one. They read the index, so they are instant.
 | `projects` | One row per project: session count, message volume, last activity. A page per codebase. |
 | `stats` | Totals plus a breakdown by tool, by month, files linked to sessions, and how many sessions were kept after the tools deleted them. |
 | `digest [--since 7d]` | A markdown rollup of recent sessions grouped by project &mdash; what you worked on, the files each touched, and any cached synopsis. `--since 2w`/`24h`/`90m`, `--project`, `--tool`, `--json`. The standup / PR-body / "what did I ship this week" view, assembled from the index. |
+
+### grep inside sessions
+
+`search` tells you *which* session; `grep` tells you *where in it*.
+
+```console
+$ sessionwiki grep -l "credential sync"          # sessions that contain it
+2f04cc44f2fe
+30857d8b9554
+
+$ sessionwiki grep -C 1 "credential sync" 2f04cc44f2fe
+2f04cc44f2fe:0:... `Credential sync for profile X (session Y) failed: relay proxy ...
+2f04cc44f2fe-1-I'll start with a broad survey in parallel.
+```
+
+The output follows grep: `id:i:text` for a match, `id-i-text` for a context
+message, and `--` where messages were skipped. `i` is the message's position in
+the session, the same number `show --jsonl` and `search --json` report, so
+`sessionwiki show <id> --jsonl | sed -n "$((i+1))p"` reads the whole message a
+hit came from.
+
+Two differences from file grep, both forced by the index: the pattern is a
+fixed string, not a regular expression, and matching is always
+case-insensitive. Messages are also windowed to `--chars` (240 by default)
+around their first match, so one hit is one readable line rather than a
+thousand-line tool output.
 
 ### Trace code back to its session
 

@@ -266,6 +266,9 @@ pub fn search(
                 v["snippet"] = serde_json::json!(plain);
                 v["snippet_marked"] = serde_json::json!(marked);
                 v["role"] = serde_json::json!(h.role);
+                // Where the best-matching message sits in the session, so an
+                // agent can jump to it (`show --jsonl`, `grep`).
+                v["i"] = serde_json::json!(h.i);
                 v
             })
             .collect();
@@ -321,6 +324,176 @@ pub fn search(
         ))
     );
     Ok(())
+}
+
+/// Options for `grep`, straight from the CLI flags.
+pub struct GrepArgs<'a> {
+    pub ids: &'a [String],
+    pub limit: usize,
+    pub tool: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub max_matches: Option<usize>,
+    pub context: usize,
+    pub chars: usize,
+    /// Print only the ids of sessions that matched.
+    pub list: bool,
+    /// Print `id:count` per session instead of the matching messages.
+    pub count: bool,
+    pub json: bool,
+    pub no_sync: bool,
+}
+
+/// Find matching messages inside sessions: sessions are the files, messages are
+/// the lines. Without ids the candidate sessions come from the index, exactly
+/// as `search` finds them; with ids they are those sessions.
+pub fn grep(pattern: &str, args: &GrepArgs) -> Result<()> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        bail!("empty pattern");
+    }
+    let mut conn = index::open()?;
+    if !args.no_sync {
+        index::sync(&mut conn, args.tool)?;
+    }
+
+    let rows = if args.ids.is_empty() {
+        candidates(&mut conn, trimmed, args)?
+    } else {
+        args.ids
+            .iter()
+            // The sync above already ran (or was declined), so resolve against
+            // the index as it stands rather than paying for a second walk.
+            .map(|id| resolve_lazy(&mut conn, id, true))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let opts = crate::grep::GrepOpts {
+        context_messages: args.context,
+        chars: args.chars,
+        max_matches: args.max_matches,
+        ..Default::default()
+    };
+    let mut sessions_with_hits = 0usize;
+    let mut total = 0usize;
+    for row in &rows {
+        let session = load_session(&conn, row)?;
+        let found = crate::grep::grep_session(&session, trimmed, &opts);
+        let matching = found
+            .hits
+            .iter()
+            .filter(|hit| !hit.matches.is_empty())
+            .count();
+        if matching == 0 {
+            continue;
+        }
+        sessions_with_hits += 1;
+        total += matching;
+        if args.list {
+            println!("{}", row.session_id);
+            continue;
+        }
+        if args.count {
+            println!("{}:{matching}", row.session_id);
+            continue;
+        }
+        if args.json {
+            for hit in &found.hits {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "id": row.session_id,
+                        "i": hit.i,
+                        "role": hit.role,
+                        "ts": hit.ts,
+                        "text": hit.text,
+                        "matches": hit.matches,
+                        "omitted_before": hit.omitted_before,
+                    }))?
+                );
+            }
+            continue;
+        }
+        for (position, hit) in found.hits.iter().enumerate() {
+            // grep's own group separator: messages were skipped here.
+            if hit.omitted_before > 0 && position > 0 {
+                println!("--");
+            }
+            // grep's convention: `:` for a match, `-` for context.
+            let mark = if hit.matches.is_empty() { '-' } else { ':' };
+            println!(
+                "{}{mark}{}{mark}{}",
+                row.session_id,
+                hit.i,
+                one_line(&hit.text)
+            );
+        }
+    }
+    if !args.list && !args.count && !args.json {
+        if sessions_with_hits == 0 {
+            println!("No matches for \"{pattern}\".");
+        } else {
+            println!();
+            println!(
+                "{}",
+                dim(&format!(
+                    "{total} messages in {sessions_with_hits} sessions. Open one: sessionwiki show <id>"
+                ))
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The sessions worth grepping when the caller named none: the index's own
+/// matches, narrowed by tool, project and age.
+fn candidates(
+    conn: &mut rusqlite::Connection,
+    pattern: &str,
+    args: &GrepArgs,
+) -> Result<Vec<index::SessionRow>> {
+    // `--since` filters after the index has ranked, so ask for more rows than
+    // the caller wants when a window is set and cut the list down afterwards.
+    let ask = match args.since {
+        Some(_) => args.limit.saturating_mul(5).clamp(args.limit, 500),
+        None => args.limit,
+    };
+    // Trigram FTS needs >=3 chars; shorter patterns fall back to a LIKE scan,
+    // the same split `search` makes.
+    let hits = if crate::util::nfc(pattern).chars().count() < 3 {
+        index::search_like(conn, pattern, ask, args.tool, args.project)?
+    } else {
+        index::search(conn, pattern, ask, args.tool, args.project)?
+    };
+    let cutoff = match args.since {
+        Some(since) => Some(
+            chrono::Utc::now()
+                .checked_sub_signed(parse_duration(since)?)
+                .with_context(|| format!("--since '{since}' is out of range"))?,
+        ),
+        None => None,
+    };
+    Ok(hits
+        .into_iter()
+        .map(|hit| hit.row)
+        .filter(|row| match cutoff {
+            Some(cutoff) => row
+                .started
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .is_some_and(|t| t.with_timezone(&chrono::Utc) >= cutoff),
+            None => true,
+        })
+        .take(args.limit)
+        .collect())
+}
+
+/// One printable line: control characters (newlines included) become spaces, so
+/// a hit is one line and an untrusted body cannot drive the terminal.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Recall in one step: search, list the candidates, and brief the top match.
@@ -573,6 +746,7 @@ pub fn show(
     id: &str,
     full: bool,
     json: bool,
+    jsonl: bool,
     outline: bool,
     window: bool,
     budget: Option<usize>,
@@ -590,6 +764,25 @@ pub fn show(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&session)?);
+        return Ok(());
+    }
+
+    // One JSON object per message, in order. Like `--json` this is the raw
+    // reader (see `redact_session_for_export`): local `show` must return the
+    // source transcript, redaction belongs on the export paths.
+    if jsonl {
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        for (i, m) in session.messages.iter().enumerate() {
+            let row = serde_json::json!({
+                "i": i,
+                "role": m.role,
+                "ts": m.ts,
+                "text": m.text,
+            });
+            writeln!(out, "{}", serde_json::to_string(&row)?)?;
+        }
         return Ok(());
     }
 
