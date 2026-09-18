@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning once it reaches 1.0.
 
+## [0.30.1] - 2026-09-18
+
+### Fixed
+
+- A closed output pipe (`sessionwiki grep -l ... | head`) no longer panics with "failed printing to stdout: Broken pipe"; the process exits quietly like grep.
+
 ## [0.30.0] - 2026-09-18
 
 ### Added

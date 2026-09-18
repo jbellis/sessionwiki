@@ -19,6 +19,9 @@ exclude = [
     ".playwright-mcp",
 ]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
