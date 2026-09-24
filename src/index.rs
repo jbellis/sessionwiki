@@ -539,8 +539,9 @@ struct ArchiveRow {
     archived_at: String,
 }
 
-/// Bring the index up to date with what is on disk. Only files whose
-/// (mtime, size) changed since the last run are re-parsed.
+/// Bring the index up to date with what is on disk. Files whose (mtime, size)
+/// changed since the last run are re-parsed; archived rows whose source has
+/// returned unchanged are made live again without re-reading the transcript.
 /// Insert one parsed session into the cache tables (files, messages, msgs,
 /// touched) and tag it if an oh-my-* harness drove it. `key` is the stored
 /// path/identity, `mtime` the change-token, `size` the byte size (0 for
@@ -624,6 +625,28 @@ fn index_one(
     Ok(())
 }
 
+/// The source exists again with the exact metadata we indexed before it was
+/// mistakenly archived. Its searchable rows are still present, so restoring
+/// the live marker needs no transcript parse or FTS rewrite.
+fn restore_unchanged(conn: &mut Connection, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    for key in keys {
+        tx.execute(
+            "DELETE FROM archive WHERE session_id = (SELECT session_id FROM files WHERE path = ?1)",
+            params![key],
+        )?;
+        tx.execute(
+            "UPDATE files SET archived_at = NULL WHERE path = ?1",
+            params![key],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// The end-of-adapter sync line. Honest about failures: "indexed 12/14
 /// (2 failed to parse)" rather than pretending everything landed.
 fn report_indexed(tool: &str, total: usize, failed: usize) {
@@ -674,13 +697,18 @@ pub fn sync_with(
     // megabytes long, so decide once per sync and skip those writes when stderr
     // is not a terminal. Warnings and the per-tool summary still print.
     let progress = std::io::stderr().is_terminal();
-    let mut known: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut known: HashMap<String, (i64, i64, bool)> = HashMap::new();
     {
-        let mut stmt = conn.prepare("SELECT path, mtime, size FROM files")?;
+        let mut stmt =
+            conn.prepare("SELECT path, mtime, size, archived_at IS NOT NULL FROM files")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
+                (
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, bool>(3)?,
+                ),
             ))
         })?;
         for row in rows {
@@ -704,12 +732,19 @@ pub fn sync_with(
         if let Some(store) = adapter.store() {
             let mut seen: Vec<String> = Vec::with_capacity(store.keys.len());
             let mut pending: Vec<String> = Vec::new();
+            let mut restore: Vec<String> = Vec::new();
             for (key, token) in &store.keys {
-                if known.get(key) != Some(&(*token, 0)) && since.is_none_or(|s| *token >= s) {
-                    pending.push(key.clone());
+                match known.get(key) {
+                    Some(&(mtime, 0, true)) if mtime == *token => restore.push(key.clone()),
+                    Some(&(mtime, 0, false)) if mtime == *token => {}
+                    old if old.is_some_and(|row| row.2) || since.is_none_or(|s| *token >= s) => {
+                        pending.push(key.clone());
+                    }
+                    _ => {}
                 }
                 seen.push(key.clone());
             }
+            restore_unchanged(conn, &restore)?;
             // Reconcile deletions only when the whole store was read this run.
             // If a backing db was present but unreadable (locked, half-written),
             // `seen` is partial - pruning off it would archive the whole corpus
@@ -767,6 +802,7 @@ pub fn sync_with(
         let discovered = adapter.discover();
         let mut seen: Vec<String> = Vec::with_capacity(discovered.files.len());
         let mut pending: Vec<(PathBuf, i64, i64)> = Vec::new();
+        let mut restore: Vec<String> = Vec::new();
 
         for f in discovered.files {
             let meta = match f.metadata() {
@@ -789,11 +825,19 @@ pub fn sync_with(
                 .unwrap_or(0);
             let size = meta.len() as i64;
             let key = f.to_string_lossy().into_owned();
-            if known.get(&key) != Some(&(mtime, size)) && since.is_none_or(|s| mtime >= s) {
-                pending.push((f, mtime, size));
+            match known.get(&key) {
+                Some(&(old_mtime, old_size, true)) if old_mtime == mtime && old_size == size => {
+                    restore.push(key.clone());
+                }
+                Some(&(old_mtime, old_size, false)) if old_mtime == mtime && old_size == size => {}
+                old if old.is_some_and(|row| row.2) || since.is_none_or(|s| mtime >= s) => {
+                    pending.push((f, mtime, size));
+                }
+                _ => {}
             }
             seen.push(key);
         }
+        restore_unchanged(conn, &restore)?;
 
         // Same guard the shared-store path has: a partial walk (an unreadable
         // directory) means `seen` is incomplete - reconciling deletions off it
@@ -2951,6 +2995,113 @@ mod embedder_hook_tests {
 
         assert!(archived_at(&c, "/data/one/sess-a").is_some());
         assert!(archived_at(&c, "/data/two/sess-b").is_some());
+    }
+
+    #[test]
+    fn a_shared_store_restores_an_archived_row_without_a_changed_token() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+        let key = "/data/one/sess-a";
+        let adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FakeStore {
+            keys: vec![(key.to_string(), 42)],
+            scope: Some("/data/one/".to_string()),
+        })];
+        sync_with(&mut c, &adapters, None).unwrap();
+        let message_id: i64 = c
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = 'sess-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        archive_session(&c, key, "sess-a").unwrap();
+
+        sync_with(&mut c, &adapters, Some(100)).unwrap();
+
+        assert_eq!(archived_at(&c, key), None);
+        assert_eq!(
+            c.query_row(
+                "SELECT id FROM messages WHERE session_id = 'sess-a'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            message_id,
+            "unchanged transcripts need no reparse"
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM archive WHERE session_id = 'sess-a'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_file_store_restores_an_archived_row_without_changed_file_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home
+            .path()
+            .join("sessions/2026/01/01/rollout-2026-01-01T10-00-00-abc.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/repo\"}}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"restic\"}}\n",
+        )
+        .unwrap();
+        let adapters: Vec<Box<dyn Adapter>> =
+            vec![Box::new(crate::adapters::Codex::in_home(home.path()))];
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+        sync_with(&mut c, &adapters, None).unwrap();
+        let key = path.to_string_lossy();
+        let sid: String = c
+            .query_row(
+                "SELECT session_id FROM files WHERE path = ?1",
+                [key.as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message_id: i64 = c
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = ?1 LIMIT 1",
+                [&sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        archive_session(&c, &key, &sid).unwrap();
+
+        sync_with(&mut c, &adapters, Some(i64::MAX)).unwrap();
+
+        assert_eq!(archived_at(&c, &key), None);
+        assert_eq!(
+            c.query_row(
+                "SELECT id FROM messages WHERE session_id = ?1 LIMIT 1",
+                [&sid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            message_id,
+            "unchanged files need no reparse"
+        );
+
+        archive_session(&c, &key, &sid).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"new content\"}}\n").unwrap();
+        sync_with(&mut c, &adapters, Some(i64::MAX)).unwrap();
+        assert_eq!(archived_at(&c, &key), None);
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM messages WHERE session_id = ?1 AND text = 'new content'",
+                [&sid],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1,
+            "changed archived files must be reparsed"
+        );
     }
 
     /// The point of `sync_with`: an embedding program indexes its own sessions

@@ -46,10 +46,9 @@ impl Adapter for ClaudeCode {
         }
     }
 
-    /// An explicit install speaks only for the rows under its own root; the
-    /// stock adapter speaks for every Claude Code row, as before.
+    /// Every install speaks only for the rows under the root it scans.
     fn reconcile_scope(&self) -> Option<String> {
-        super::root_scope(self.root.as_deref())
+        super::root_scope(self.root().as_deref())
     }
 
     fn discover(&self) -> Discovered {
@@ -450,8 +449,8 @@ mod tests {
         );
         assert_eq!(
             ClaudeCode::default().reconcile_scope(),
-            None,
-            "the stock adapter still speaks for every claude-code row"
+            crate::adapters::root_scope(ClaudeCode::default().root().as_deref()),
+            "the stock adapter speaks only for its own install"
         );
     }
 }

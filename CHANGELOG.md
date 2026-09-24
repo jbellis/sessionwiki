@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning once it reaches 1.0.
 
+## [0.30.2] - 2026-09-24
+
+### Fixed
+
+- Syncing the stock Codex or Claude Code store no longer marks sessions from other profile homes as deleted in a shared index.
+- A later sync restores a session marked archived while its source file or shared-store record still exists, even when its modification token has not changed.
+
 ## [0.30.1] - 2026-09-18
 
 ### Fixed

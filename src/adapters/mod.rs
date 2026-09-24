@@ -110,8 +110,7 @@ pub trait Adapter {
 }
 
 /// The [`Adapter::reconcile_scope`] for an adapter pinned to `root`: every key
-/// under that directory, as a path prefix. `None` (stock location) keeps the
-/// adapter speaking for every row of its tool.
+/// under that directory, as a path prefix.
 pub(crate) fn root_scope(root: Option<&Path>) -> Option<String> {
     let root = root?;
     let mut prefix = root.to_string_lossy().into_owned();
