@@ -46,10 +46,9 @@ impl Adapter for Codex {
         }
     }
 
-    /// An explicit install speaks only for the rows under its own root; the
-    /// stock adapter speaks for every Codex row, as before.
+    /// Every install speaks only for the rows under the root it scans.
     fn reconcile_scope(&self) -> Option<String> {
-        super::root_scope(self.root.as_deref())
+        super::root_scope(self.root().as_deref())
     }
 
     fn discover(&self) -> Discovered {
@@ -327,8 +326,8 @@ mod tests {
         );
         assert_eq!(
             Codex::default().reconcile_scope(),
-            None,
-            "the stock adapter still speaks for every codex row"
+            crate::adapters::root_scope(Codex::default().root().as_deref()),
+            "the stock adapter speaks only for its own install"
         );
     }
 }
