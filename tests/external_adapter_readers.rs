@@ -47,6 +47,7 @@ impl Adapter for OneFileAdapter {
                 role: Role::User,
                 text: fs::read_to_string(path)?,
                 ts: None,
+                tool: None,
             }],
             touched: vec![],
             edits: vec![],

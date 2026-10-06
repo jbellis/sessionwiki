@@ -111,6 +111,23 @@ pub trait Adapter {
     }
 }
 
+/// Parse a session through an adapter and normalize any structured tool parts.
+/// Callers that consume adapter output should use this rather than `parse`
+/// directly so indexing and live readers share identical tool summaries.
+pub fn parse_session(adapter: &dyn Adapter, path: &Path) -> Result<Session> {
+    let mut session = adapter.parse(path)?;
+    crate::tool_summary::fold_tool_parts(&mut session);
+    Ok(session)
+}
+
+/// Parse one key from a shared-store adapter and apply the same normalization
+/// as the ordinary file-backed path.
+pub fn parse_session_key(adapter: &dyn Adapter, key: &str) -> Result<Session> {
+    let mut session = adapter.parse_key(key)?;
+    crate::tool_summary::fold_tool_parts(&mut session);
+    Ok(session)
+}
+
 /// The [`Adapter::reconcile_scope`] for an adapter pinned to `root`: every key
 /// under that directory, as a path prefix.
 pub(crate) fn root_scope(root: Option<&Path>) -> Option<String> {

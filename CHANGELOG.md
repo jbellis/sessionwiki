@@ -6,6 +6,22 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **Tool calls are stored as one compact line each**, for example
+  `→ Bash(cargo test) ⇒ error · 12 lines — error[E0425]: ...`: tool name,
+  primary argument, status, output line count, and the first output line on
+  error. Every adapter (Claude Code, Codex, Gemini, gptme, Cline/Roo/Kilo,
+  Continue, Gajae, OpenCode) emits structured calls and results, and one shared
+  renderer formats them. The line is what `show`, `brief`, the web UI, MCP and
+  search see; `brief` now includes tool lines by default, and `--tools`
+  (`brief`) or `--full` (`show`) append bounded output when the original
+  session file is still on disk. Tool output is no longer indexed, so the
+  index shrinks and a string that only appeared mid-output no longer matches a
+  search. Schema v9: existing indexes rebuild once on first use. The first
+  run after upgrading re-parses every session, which can take a while on a
+  large store.
+
 ## [0.33.2] - 2026-10-08
 
 ### Fixed
@@ -27,7 +43,6 @@ semantic versioning once it reaches 1.0.
   On the machine this was found, all 46 Gemini sessions were affected. The
   project is now the recorded path, and the first open after upgrading
   corrects rows already indexed.
-
 ## [0.33.1] - 2026-10-07
 
 ### Fixed
@@ -94,7 +109,6 @@ semantic versioning once it reaches 1.0.
   are now sub-agent sessions like Claude Code's, and the first open after
   upgrading reclassifies rows already indexed by reading each file's first
   line (a one-off update, not a rebuild).
-
 ## [0.31.0] - 2026-10-06
 
 ### Added

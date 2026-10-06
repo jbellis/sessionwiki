@@ -154,11 +154,11 @@ GB). After that, updates are incremental and take seconds.
 | `search <query>` | Search every message across tools. Terms are ANDed within one message; double quotes mark a phrase. Use `--role user,assistant` to search only the conversation, excluding tool output. Matching depends on the configured tokenizer (see `tokenizer`). |
 | `tokenizer [SPEC]` | Show the current FTS5 tokenizer, or set one and rebuild only the search index. |
 | `recall <query>` | Search, list the matches, and brief the top one in a single command &mdash; the fastest way back into a past session. `--tool`, `--project`, `-n`, `--json` (for agents). |
-| `show <id>` | One session as a readable transcript. `--full` expands tool calls, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
+| `show <id>` | One session as a readable transcript with compact tool summaries. `--full` appends bounded tool output from live files, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
 | `summarize [id]` | 1&ndash;2 sentence synopses via **your own LLM CLI** (`claude -p` default; `--cmd` / `SESSIONWIKI_SUMMARIZER` to change), cached in the index and shown in `show`, `--outline`, and the web sidebar. Without an id, batches the `--recent N` newest. |
 | `resume <id>` | Reopen the session in its original tool: `claude --resume` / `codex resume`, run in the right project directory. Subagent transcripts resume their parent. `--print` to just show the command. |
 | `migrate <id> <dir>` | Make a session resumable from a different project directory: Claude Code copies the transcript into `<dir>`'s store, Codex resumes by id from anywhere, Gemini copies the chat over. The original is never touched. `--config-dir <DIR>` writes into a specific store instead of the default one - for a machine where each account has its own (`CLAUDE_CONFIG_DIR` is honoured when the flag is absent). |
-| `brief <id>` | Emit the session as a markdown briefing (head and tail, middle omitted) to carry context into any tool &mdash; including across tools. `--max-chars`, `--tools`. |
+| `brief <id>` | Emit the session as a markdown briefing (head and tail, middle omitted) with compact tool summaries. `--tools` appends bounded output from live files; `--max-chars` sets the briefing budget. |
 | `web` | Local viewer on `127.0.0.1:7575`: day-grouped sessions, live search with highlighted snippets, rendered transcripts with outlines/tags/related, resume commands, light/dark, UI auto-localized (en/ko/ja/zh). Reads the existing index; `web --sync` refreshes first. Never leaves localhost. |
 | `sync [--tool]` | Build or refresh the index on demand. Pair with `--no-sync` (below) so queries skip the store walk. Handy from a cron to keep the index warm. |
 
@@ -244,7 +244,8 @@ part a generation-time hook can't do &mdash; it works for the sessions that
 already exist, and the ones the tool deleted while you weren't looking.
 
 **It also reclaims disk.** The index keeps only a distilled copy of each session
-(the conversation and its file links, minus bulky tool output), so it is far
+(the conversation and its file links, with tool calls represented by compact
+summary lines rather than bulky output), so it is far
 smaller than the raw stores &mdash; roughly 7&times; on the machine above (47 GB
 &rarr; ~7 GB). Delete the old raw sessions to free the space and `search`,
 `trace`, `brief`, and reading still work from the index. The tradeoff: an
@@ -310,7 +311,7 @@ flowchart LR
   cache. Cached summaries survive schema upgrades on purpose: rebuilding an
   index is cheap, re-running an LLM over your history is not.
 - Noise is filtered deliberately: repeated harness boilerplate and bulky tool
-  outputs stay out of the index so search results stay signal.
+  outputs stay out of the index; compact tool summaries remain searchable.
 
 <details>
 <summary><b>FAQ: why not just grep the session folders?</b></summary>

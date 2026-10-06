@@ -186,7 +186,7 @@ enum Command {
         /// Budget for the briefing body; the middle of long sessions is omitted
         #[arg(long, default_value_t = 24000)]
         max_chars: usize,
-        /// Include tool calls in the briefing
+        /// Append bounded tool output to the compact tool summaries
         #[arg(long)]
         tools: bool,
         /// Emit a JSON object { id, tool, project, title, started, source,

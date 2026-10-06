@@ -72,6 +72,7 @@ fn flush(messages: &mut Vec<Message>, role: Option<Role>, buf: &mut Vec<String>)
                 role,
                 text,
                 ts: None,
+                tool: None,
             });
         }
     }

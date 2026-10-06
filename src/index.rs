@@ -82,7 +82,7 @@ pub fn existing_db_path() -> Option<PathBuf> {
 /// deleted - and are versioned separately by `meta.durable_version` via forward,
 /// additive-only migrations that never drop, so they survive every upgrade. The
 /// two counters are independent and must never gate each other.
-pub const SCHEMA_VERSION: i64 = 8; // 8: redact secrets at index time (rebuild scrubs old rows)
+pub const SCHEMA_VERSION: i64 = 9; // 9: tool calls stored as compact summary lines
 
 const DEFAULT_FTS_TOKENIZER: &str = "trigram";
 const FTS_TOKENIZER_META_KEY: &str = "fts_tokenizer";
@@ -1112,7 +1112,7 @@ pub fn sync_with(
                     }
                     // A failed parse is warned, not silently dropped: the user
                     // must know a session is missing from the corpus.
-                    let session = match adapter.parse_key(key) {
+                    let session = match adapters::parse_session_key(adapter.as_ref(), key) {
                         Ok(s) => s,
                         Err(e) => {
                             failed += 1;
@@ -1203,7 +1203,7 @@ pub fn sync_with(
 
             // A failed parse is warned, not silently dropped: the user must
             // know a session is missing from the corpus.
-            let session = match adapter.parse(&path) {
+            let session = match adapters::parse_session(adapter.as_ref(), &path) {
                 Ok(s) => s,
                 Err(e) => {
                     failed += 1;
@@ -2607,6 +2607,7 @@ pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::
                 },
                 text,
                 ts: None,
+                tool: None,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -3252,6 +3253,7 @@ mod edits_tests {
                 role: Role::User,
                 text: "my key is sk-abcdef012345678901234567890123 ok".into(),
                 ts: None,
+                tool: None,
             }],
             touched: vec!["/p/a.rs".into()],
             edits: vec![EditEvent {
@@ -3484,6 +3486,7 @@ mod embedder_hook_tests {
                     role: Role::User,
                     text: "make the tests green".into(),
                     ts: None,
+                    tool: None,
                 }],
                 touched: vec![],
                 edits: vec![],

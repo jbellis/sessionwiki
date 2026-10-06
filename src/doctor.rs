@@ -257,9 +257,9 @@ mod tests {
         )
         .unwrap();
 
-        let checks = index_checks(&c, 8);
+        let checks = index_checks(&c, 9);
         let schema = checks.iter().find(|c| c.name == "index schema").unwrap();
-        assert_eq!(schema.status, Status::Warn, "v7 vs expected v8 is a warn");
+        assert_eq!(schema.status, Status::Warn, "v7 vs expected v9 is a warn");
         let tokenizer = checks
             .iter()
             .find(|c| c.name == "search tokenizer")
@@ -288,7 +288,7 @@ mod tests {
     fn a_missing_core_table_is_a_fail_not_a_healthy_zero() {
         let c = conn();
         c.execute("DROP TABLE edits", []).unwrap();
-        let tables = index_checks(&c, 8)
+        let tables = index_checks(&c, 9)
             .into_iter()
             .find(|c| c.name == "index tables")
             .unwrap();
@@ -302,8 +302,8 @@ mod tests {
     #[test]
     fn index_checks_pass_a_current_schema() {
         let c = conn();
-        c.pragma_update(None, "user_version", 8i64).unwrap();
-        let checks = index_checks(&c, 8);
+        c.pragma_update(None, "user_version", 9i64).unwrap();
+        let checks = index_checks(&c, 9);
         let schema = checks
             .into_iter()
             .find(|c| c.name == "index schema")
