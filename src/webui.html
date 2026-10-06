@@ -482,6 +482,13 @@
       <select id="tool" aria-label="Filter by tool">
         <option value="">all tools</option>
       </select>
+      <select id="role" aria-label="Filter by message role">
+        <option value="">all message roles</option>
+        <option value="user,assistant">user and assistant</option>
+        <option value="user">user messages</option>
+        <option value="assistant">assistant replies</option>
+        <option value="tool">tool output</option>
+      </select>
     </div>
     <nav id="list"></nav>
     <div class="sidefoot">
@@ -527,6 +534,11 @@ const I18N = {
     loading: "loading index…",
     searchPh: "Search sessions",
     allTools: "all tools",
+    allRoles: "all message roles",
+    conversationRoles: "user and assistant",
+    userRole: "user messages",
+    assistantRole: "assistant replies",
+    toolRole: "tool output",
     groups: { today: "Today", yesterday: "Yesterday", week: "This week", month: "This month", earlier: "Earlier" },
     msgs: (n) => `${n} msgs`,
     subagent: "subagent",
@@ -553,6 +565,11 @@ const I18N = {
     loading: "인덱스 불러오는 중…",
     searchPh: "세션 검색",
     allTools: "모든 툴",
+    allRoles: "모든 메시지 역할",
+    conversationRoles: "사용자와 어시스턴트",
+    userRole: "사용자 메시지",
+    assistantRole: "어시스턴트 답변",
+    toolRole: "도구 출력",
     groups: { today: "오늘", yesterday: "어제", week: "이번 주", month: "이번 달", earlier: "이전" },
     msgs: (n) => `메시지 ${n}`,
     subagent: "서브에이전트",
@@ -579,6 +596,11 @@ const I18N = {
     loading: "インデックスを読み込み中…",
     searchPh: "セッションを検索",
     allTools: "すべてのツール",
+    allRoles: "すべてのメッセージ役割",
+    conversationRoles: "ユーザーとアシスタント",
+    userRole: "ユーザーメッセージ",
+    assistantRole: "アシスタントの返答",
+    toolRole: "ツール出力",
     groups: { today: "今日", yesterday: "昨日", week: "今週", month: "今月", earlier: "それ以前" },
     msgs: (n) => `${n}件`,
     subagent: "サブエージェント",
@@ -605,6 +627,11 @@ const I18N = {
     loading: "正在加载索引…",
     searchPh: "搜索会话",
     allTools: "全部工具",
+    allRoles: "全部消息角色",
+    conversationRoles: "用户和助手",
+    userRole: "用户消息",
+    assistantRole: "助手回复",
+    toolRole: "工具输出",
     groups: { today: "今天", yesterday: "昨天", week: "本周", month: "本月", earlier: "更早" },
     msgs: (n) => `${n}条`,
     subagent: "子代理",
@@ -638,6 +665,11 @@ const LANG_NAMES = { en: "English", ko: "한국어", ja: "日本語", zh: "中�
 function applyStaticStrings() {
   $("q").placeholder = L.searchPh;
   $("tool").options[0].textContent = L.allTools;
+  $("role").options[0].textContent = L.allRoles;
+  $("role").options[1].textContent = L.conversationRoles;
+  $("role").options[2].textContent = L.userRole;
+  $("role").options[3].textContent = L.assistantRole;
+  $("role").options[4].textContent = L.toolRole;
   $("hint").textContent = L.hint;
   $("ph-title").textContent = L.phTitle;
   $("ph-p1").textContent = L.phP1;
@@ -1016,9 +1048,11 @@ async function refresh() {
   const q = $("q").value.trim();
   const tool = $("tool").value;
   const t = tool ? `&tool=${encodeURIComponent(tool)}` : "";
+  const roles = $("role").value;
+  const r = roles ? `&roles=${encodeURIComponent(roles)}` : "";
   renderTagBar();
   if (q.length >= 3) {
-    renderItems(await jget(`/api/search?q=${encodeURIComponent(q)}${t}`), true);
+    renderItems(await jget(`/api/search?q=${encodeURIComponent(q)}${t}${r}`), true);
   } else if (currentTag) {
     renderItems(await jget(`/api/sessions?limit=200${t}&tag=${encodeURIComponent(currentTag)}`), false);
   } else {
@@ -1050,6 +1084,7 @@ $("q").addEventListener("input", () => {
   timer = setTimeout(refresh, 250);
 });
 $("tool").addEventListener("change", refresh);
+$("role").addEventListener("change", refresh);
 document.addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== $("q")) {
     e.preventDefault();

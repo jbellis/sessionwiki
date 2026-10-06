@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use sessionwiki::{commands, doctor, web};
+use sessionwiki::{commands, doctor, model::Role, web};
 
 /// Find, search, and read every AI coding session on your machine - across
 /// Claude Code, Codex, Gemini CLI, OpenCode, Cline, and more. 100% local.
@@ -54,6 +54,9 @@ enum Command {
         /// Filter by project path substring
         #[arg(long)]
         project: Option<String>,
+        /// Filter by message role (user, assistant, tool); comma-separate multiple roles
+        #[arg(long, value_delimiter = ',')]
+        role: Vec<Role>,
         /// Filter by swapdex account profile (the @badge; needs a swapdex switch history)
         #[arg(long)]
         account: Option<String>,
@@ -341,17 +344,21 @@ fn main() {
             limit,
             tool,
             project,
+            role,
             account,
             json,
             no_sync,
-        } => commands::search(
+        } => commands::search_with_options(
             &query,
-            limit,
-            tool.as_deref(),
-            project.as_deref(),
-            account.as_deref(),
-            json,
-            no_sync,
+            commands::SearchOptions {
+                limit,
+                tool: tool.as_deref(),
+                project: project.as_deref(),
+                account: account.as_deref(),
+                json,
+                no_sync,
+                roles: (!role.is_empty()).then_some(role.as_slice()),
+            },
         ),
         Command::Tokenizer { spec } => commands::tokenizer(spec.as_deref()),
         Command::Recall {

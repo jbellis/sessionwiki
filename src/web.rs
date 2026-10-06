@@ -1,3 +1,4 @@
+use crate::model::Role;
 use crate::{commands, index, resume};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -122,7 +123,12 @@ fn html(body: &str) -> Result<Boxed> {
 }
 
 fn json_response(v: serde_json::Value) -> Result<Boxed> {
+    json_response_with_status(v, 200)
+}
+
+fn json_response_with_status(v: serde_json::Value, status: u16) -> Result<Boxed> {
     Ok(Response::from_string(v.to_string())
+        .with_status_code(status)
         .with_header(
             Header::from_bytes(
                 &b"Content-Type"[..],
@@ -193,10 +199,28 @@ fn api_search(conn: &Connection, query: &str) -> Result<Boxed> {
         return json_response(json!([]));
     }
     let tool = param(query, "tool");
+    let roles = match param(query, "roles") {
+        Some(value) => {
+            let parsed = value
+                .split(',')
+                .map(str::parse::<Role>)
+                .collect::<std::result::Result<Vec<_>, _>>();
+            match parsed {
+                Ok(roles) if !roles.is_empty() => Some(roles),
+                _ => {
+                    return json_response_with_status(
+                        json!({"error": "roles must be a comma-separated list of user, assistant, or tool"}),
+                        400,
+                    )
+                }
+            }
+        }
+        None => None,
+    };
     let limit = param(query, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    let hits = index::search(conn, qt, limit, tool.as_deref(), None)?;
+    let hits = index::search_with_roles(conn, qt, limit, tool.as_deref(), None, roles.as_deref())?;
     json_response(json!(hits
         .iter()
         .map(|h| {

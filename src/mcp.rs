@@ -104,6 +104,7 @@ fn tools_list() -> Value {
                     "query": {"type": "string", "description": "Terms are ANDed within one message; double quotes make a phrase. With the default trigram tokenizer, phrases preserve whitespace and at least one term must have 3 or more characters; word tokenizers ignore whitespace between phrase words and accept short terms."},
                     "tool": {"type": "string", "description": "Restrict to one tool, e.g. codex."},
                     "project": {"type": "string", "description": "Restrict to a project (substring match)."},
+                    "roles": {"type": "array", "items": {"type": "string", "enum": ["user", "assistant", "tool"]}, "minItems": 1, "description": "Restrict matches to these message roles."},
                     "limit": {"type": "integer", "description": "Max results, 1-50 (default 10)."}
                 },
                 "required": ["query"]
@@ -620,6 +621,33 @@ fn tool_search(conn: &mut Option<Connection>, args: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    let roles = match args.get("roles") {
+        None => None,
+        Some(Value::Array(values)) if !values.is_empty() => {
+            let parsed: Result<Vec<crate::model::Role>, String> = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            "roles must contain only user, assistant, or tool".to_string()
+                        })?
+                        .parse()
+                        .map_err(str::to_string)
+                })
+                .collect();
+            match parsed {
+                Ok(roles) => Some(roles),
+                Err(message) => return text_result(message, true),
+            }
+        }
+        Some(_) => {
+            return text_result(
+                "roles must be a non-empty array of user, assistant, or tool".into(),
+                true,
+            )
+        }
+    };
     let Some(conn) = get_conn(conn) else {
         return text_result("[]".into(), false); // no index yet: empty, honest
     };
@@ -641,7 +669,14 @@ fn tool_search(conn: &mut Option<Connection>, args: &Value) -> Value {
     // sibling session shows on a subsequent search without the request ever
     // waiting on the store walk.
     spawn_background_freshen();
-    let hits = match crate::index::search(conn, query, limit, tool, project) {
+    let hits = match crate::index::search_with_roles(
+        conn,
+        query,
+        limit,
+        tool,
+        project,
+        roles.as_deref(),
+    ) {
         Ok(h) => h,
         Err(e) => {
             return text_result(
@@ -907,6 +942,42 @@ mod tests {
         assert!(arr[0].get("path").is_none(), "no absolute path");
         assert!(arr[0].get("snippet_marked").is_none(), "marked dropped");
         assert!(!text.contains("/home/me"), "no home-dir leak: {text}");
+    }
+
+    #[test]
+    fn search_role_filter_returns_only_requested_message_roles() {
+        let _lock = LOCK.lock().unwrap();
+        let conn = seed("sessionwiki-test-mcp-search-role");
+        conn.execute(
+            "INSERT INTO messages(session_id,role,text) VALUES('s1','tool','preflight command output')",
+            [],
+        )
+        .unwrap();
+        let mid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO msgs(rowid,text) VALUES(?1,'preflight command output')",
+            params![mid],
+        )
+        .unwrap();
+
+        let (v, text) = tool(
+            "search_sessions",
+            json!({"query": "preflight", "roles": ["user"]}),
+        );
+        assert!(v["result"]["isError"] != true, "not an error: {v}");
+        let hits: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(hits[0]["role"], "user");
+        assert!(!hits[0]["snippet"]
+            .as_str()
+            .unwrap()
+            .contains("command output"));
+
+        let (invalid, message) = tool(
+            "search_sessions",
+            json!({"query": "preflight", "roles": ["system"]}),
+        );
+        assert_eq!(invalid["result"]["isError"], true);
+        assert!(message.contains("role must be user, assistant, or tool"));
     }
 
     #[test]
@@ -1400,6 +1471,10 @@ mod tests {
         let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            tools[0]["inputSchema"]["properties"]["roles"]["items"]["enum"],
+            json!(["user", "assistant", "tool"])
+        );
         assert_eq!(
             names,
             [
