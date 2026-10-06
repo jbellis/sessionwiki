@@ -19,6 +19,11 @@ semantic versioning once it reaches 1.0.
   matched only the exact substring, including its whitespace. Quote words to
   require a phrase; phrase whitespace follows the configured tokenizer, and
   short terms still work alongside longer indexed terms.
+
+## [0.30.2] - 2026-10-06
+
+### Fixed
+
 - **`projects` LAST and its order follow last activity, as `list` does.**
   0.30.1 moved `list` to each session's last message, but `projects` still
   took LAST from when its newest session began, so a project worked in
