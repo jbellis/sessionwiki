@@ -246,15 +246,7 @@ pub fn search(
     if !no_sync {
         index::sync(&mut conn, tool)?;
     }
-    // Trigram FTS needs >=3 chars; shorter terms (1-2 chars, including 2-syllable
-    // Korean like 회사/검색 - the most common Korean word length - and 2-char
-    // latin fragments) fall back to a LIKE scan. Counted on the NFC form so
-    // decomposed Korean counts by visible character, not by combining scalar.
-    let mut hits = if crate::util::nfc(trimmed).chars().count() < 3 {
-        index::search_like(&conn, trimmed, limit, tool, project)?
-    } else {
-        index::search(&conn, trimmed, limit, tool, project)?
-    };
+    let mut hits = index::search(&conn, trimmed, limit, tool, project)?;
     if let Some(a) = account {
         hits.retain(|h| h.row.account.as_deref() == Some(a));
         // (search relevance already ordered; post-filter keeps the top matches)
@@ -325,6 +317,22 @@ pub fn search(
     Ok(())
 }
 
+/// Show the configured FTS5 tokenizer or change it by rebuilding only `msgs`.
+pub fn tokenizer(spec: Option<&str>) -> Result<()> {
+    let conn = index::open()?;
+    match spec {
+        Some(spec) => {
+            if index::set_tokenizer_spec(&conn, spec)? {
+                println!("FTS tokenizer set to {spec}; search index rebuilt.");
+            } else {
+                println!("FTS tokenizer is already {spec}.");
+            }
+        }
+        None => println!("{}", index::tokenizer_spec(&conn)?),
+    }
+    Ok(())
+}
+
 /// Recall in one step: search, list the candidates, and brief the top match.
 /// Collapses the usual search -> eyeball id -> brief loop into one command.
 pub fn recall(
@@ -344,11 +352,7 @@ pub fn recall(
     if !no_sync {
         index::sync(&mut conn, tool)?;
     }
-    let hits = if crate::util::nfc(trimmed).chars().count() < 3 {
-        index::search_like(&conn, trimmed, limit, tool, project)?
-    } else {
-        index::search(&conn, trimmed, limit, tool, project)?
-    };
+    let hits = index::search(&conn, trimmed, limit, tool, project)?;
     if hits.is_empty() {
         if json {
             let v = serde_json::json!({

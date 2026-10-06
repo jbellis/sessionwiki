@@ -11,7 +11,9 @@ fn seed(dir: &std::path::Path) {
     std::env::set_var("SESSIONWIKI_DATA", dir);
     let conn = sessionwiki::index::open().unwrap();
     conn.execute_batch(
-        "DELETE FROM files; DELETE FROM messages; DELETE FROM msgs; DELETE FROM touched;",
+        "DELETE FROM files;
+         INSERT INTO msgs(msgs,rowid,text) SELECT 'delete',id,text FROM messages;
+         DELETE FROM messages; DELETE FROM touched;",
     )
     .unwrap();
     // A title carrying an ESC and a raw newline: both must be stripped and must

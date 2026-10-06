@@ -6,6 +6,20 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable FTS5 tokenizer.** `sessionwiki tokenizer` shows the current
+  setting; `sessionwiki tokenizer <SPEC>` changes it and rebuilds only the FTS
+  table from indexed messages. The choice is stored in the index and shared by
+  CLI, web, and MCP.
+
+### Fixed
+
+- **Search now ANDs terms within one message.** Previously a multi-word query
+  matched only the exact substring, including its whitespace. Quote words to
+  require a phrase; phrase whitespace follows the configured tokenizer, and
+  short terms still work alongside longer indexed terms.
+
 ## [0.30.2] - 2026-10-06
 
 ### Fixed

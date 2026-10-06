@@ -41,9 +41,9 @@ enum Command {
         #[arg(long)]
         no_sync: bool,
     },
-    /// Full-text search across every session of every tool
+    /// Search sessions; terms are ANDed within one message and quotes mark phrases
     Search {
-        /// Text to look for (substring match, works for CJK too)
+        /// AND terms within a message; phrase whitespace follows the configured tokenizer
         query: String,
         /// Max sessions to show
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -64,9 +64,14 @@ enum Command {
         #[arg(long)]
         no_sync: bool,
     },
+    /// Show or change the FTS5 tokenizer (changing it rebuilds only the FTS index)
+    Tokenizer {
+        /// FTS5 tokenizer spec; quote values with spaces, e.g. 'porter unicode61'
+        spec: Option<String>,
+    },
     /// Recall past work in one step: search, then brief the top match
     Recall {
-        /// What to recall - a topic, error text, or identifier (exact phrasing)
+        /// AND-search terms within a message; quote words when they must form a phrase
         query: String,
         /// How many candidate matches to list (the top one is briefed)
         #[arg(short = 'n', long, default_value_t = 5)]
@@ -348,6 +353,7 @@ fn main() {
             json,
             no_sync,
         ),
+        Command::Tokenizer { spec } => commands::tokenizer(spec.as_deref()),
         Command::Recall {
             query,
             limit,
