@@ -196,12 +196,7 @@ fn api_search(conn: &Connection, query: &str) -> Result<Boxed> {
     let limit = param(query, "limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    // <3 chars (incl. 2-syllable Korean) is below the trigram floor; LIKE-scan it.
-    let hits = if crate::util::nfc(qt).chars().count() < 3 {
-        index::search_like(conn, qt, limit, tool.as_deref(), None)?
-    } else {
-        index::search(conn, qt, limit, tool.as_deref(), None)?
-    };
+    let hits = index::search(conn, qt, limit, tool.as_deref(), None)?;
     json_response(json!(hits
         .iter()
         .map(|h| {

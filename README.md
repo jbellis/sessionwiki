@@ -139,7 +139,8 @@ GB). After that, updates are incremental and take seconds.
 |---|---|
 | `scan` | Discover session stores on this machine. Pure filesystem walk, instant. |
 | `list` | Recent sessions across all tools in one timeline. `--tool codex`, `--project api`, `--tag spike`, `-n 50`, `--all` (include subagent transcripts). |
-| `search <query>` | Full-text search over every message of every tool. Minimum 3 characters. |
+| `search <query>` | Search every message across tools. Terms are ANDed within one message; double quotes mark a phrase. Matching depends on the configured tokenizer (see `tokenizer`). |
+| `tokenizer [SPEC]` | Show the current FTS5 tokenizer, or set one and rebuild only the search index. |
 | `recall <query>` | Search, list the matches, and brief the top one in a single command &mdash; the fastest way back into a past session. `--tool`, `--project`, `-n`, `--json` (for agents). |
 | `show <id>` | One session as a readable transcript. `--full` expands tool calls, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
 | `summarize [id]` | 1&ndash;2 sentence synopses via **your own LLM CLI** (`claude -p` default; `--cmd` / `SESSIONWIKI_SUMMARIZER` to change), cached in the index and shown in `show`, `--outline`, and the web sidebar. Without an id, batches the `--recent N` newest. |
@@ -150,6 +151,18 @@ GB). After that, updates are incremental and take seconds.
 | `sync [--tool]` | Build or refresh the index on demand. Pair with `--no-sync` (below) so queries skip the store walk. Handy from a cron to keep the index warm. |
 
 Every query command (`search`, `list`, `recall`, `show`, `brief`, `resume`, `trace`) takes `--no-sync` to query the already-built index without re-walking the stores &mdash; the fast path when something else (e.g. a cron running `sessionwiki sync`) keeps the index current.
+
+Search uses the `trigram` tokenizer by default, which finds substrings and works
+well for CJK text. Under `trigram`, a quoted phrase includes its whitespace
+exactly, so a phrase with a space does not match when the transcript wraps that
+space onto a newline. `unicode61` searches words: whitespace between phrase
+words is ignored, but partial-word substring matches are unavailable and CJK
+search is weaker. Inspect or change the setting with `sessionwiki tokenizer`
+and `sessionwiki tokenizer unicode61`. The setting is stored in the index and
+shared by CLI, web, and MCP; changing it rebuilds the FTS table from the
+existing indexed messages without reparsing session files. Quote specs that
+contain spaces, for example `sessionwiki tokenizer 'porter unicode61'` or
+`sessionwiki tokenizer 'unicode61 remove_diacritics 2'`.
 
 ### Session engineering
 
@@ -272,7 +285,7 @@ flowchart LR
         C["~/.gemini/tmp"]
     end
     A & B & C --> AD["adapters<br>(one small file per tool)"]
-    AD --> IDX[("SQLite FTS5 index<br>trigram tokenizer")]
+    AD --> IDX[("SQLite FTS5 index<br>trigram by default; configurable")]
     IDX --> CLI["CLI<br>scan / list / search / show<br>summarize / resume / brief"]
     IDX --> WEB["web viewer<br>127.0.0.1 only"]
 ```

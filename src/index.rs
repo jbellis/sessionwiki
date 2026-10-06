@@ -1,6 +1,6 @@
 use crate::adapters::{self, Adapter};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -83,6 +83,9 @@ pub fn existing_db_path() -> Option<PathBuf> {
 /// two counters are independent and must never gate each other.
 pub const SCHEMA_VERSION: i64 = 8; // 8: redact secrets at index time (rebuild scrubs old rows)
 
+const DEFAULT_FTS_TOKENIZER: &str = "trigram";
+const FTS_TOKENIZER_META_KEY: &str = "fts_tokenizer";
+
 /// Version of the durable schema this binary ships. The durable CREATE
 /// statements are frozen at this shape; every later durable change is a
 /// migration in DURABLE_MIGRATIONS. Independent of SCHEMA_VERSION (the cache).
@@ -91,17 +94,26 @@ const BASELINE_DURABLE_VERSION: i64 = 1;
 /// Read meta.durable_version, seeding the baseline when absent. Absence covers
 /// both a fresh DB (durables just created at baseline) and an existing
 /// pre-feature index (durables already at baseline) - both correctly start at
-/// BASELINE. INSERT OR IGNORE is safe under a concurrent first-open.
+/// BASELINE. The common path is read-only; INSERT OR IGNORE handles a concurrent
+/// first-open after the initial read.
 fn read_or_init_durable_version(conn: &Connection) -> Result<i64> {
+    let read = || -> Result<Option<String>> {
+        Ok(conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'durable_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    };
+    if let Some(v) = read()? {
+        return Ok(v.parse().unwrap_or(BASELINE_DURABLE_VERSION));
+    }
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('durable_version', ?1)",
         params![BASELINE_DURABLE_VERSION.to_string()],
     )?;
-    let v: String = conn.query_row(
-        "SELECT value FROM meta WHERE key = 'durable_version'",
-        [],
-        |r| r.get(0),
-    )?;
+    let v = read()?.context("durable_version missing after initialization")?;
     Ok(v.parse().unwrap_or(BASELINE_DURABLE_VERSION))
 }
 
@@ -195,9 +207,115 @@ fn run_durable_migrations(conn: &Connection, migrations: &[Migration]) -> Result
     Ok(())
 }
 
-/// Create the derived cache + durable tables if absent (idempotent). Shared by
-/// `open()` and tests so both exercise the identical DDL.
+/// Ensure durable settings exist before the cache schema reads them.
+fn create_meta_schema(conn: &Connection) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        // Durable key/value settings and versioning survive cache rebuilds.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta(
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )?;
+    }
+    Ok(())
+}
+
+/// The chosen FTS tokenizer is durable configuration. Indexes predating this
+/// setting use the historical trigram tokenizer until a user changes it.
+pub fn tokenizer_spec(conn: &Connection) -> Result<String> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [FTS_TOKENIZER_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| DEFAULT_FTS_TOKENIZER.to_string()))
+}
+
+fn sql_string_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn validate_tokenizer_spec(conn: &Connection, spec: &str) -> Result<()> {
+    let sql = format!(
+        "CREATE VIRTUAL TABLE temp.sessionwiki_tokenizer_validation USING fts5(\
+             text, tokenize='{}');\
+         DROP TABLE temp.sessionwiki_tokenizer_validation;",
+        sql_string_literal(spec)
+    );
+    conn.execute_batch(&sql)
+        .map_err(anyhow::Error::from)
+        .context("invalid FTS5 tokenizer specification")
+}
+
+fn create_msgs_table(conn: &Connection, spec: &str) -> Result<()> {
+    let sql = format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(\
+             text, content='messages', content_rowid='id', tokenize='{}');",
+        sql_string_literal(spec)
+    );
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+/// Store a tokenizer choice and rebuild only the FTS index. Session files are
+/// not parsed; the external-content table rebuilds from `messages` in SQLite.
+/// Returns whether the setting changed.
+pub fn set_tokenizer_spec(conn: &Connection, spec: &str) -> Result<bool> {
+    validate_tokenizer_spec(conn, spec)?;
+    let current = tokenizer_spec(conn)?;
+    if current == spec {
+        return Ok(false);
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let outcome = (|| -> Result<bool> {
+        let current = tokenizer_spec(conn)?;
+        if current == spec {
+            return Ok(false);
+        }
+        conn.execute_batch("DROP TABLE msgs;")?;
+        create_msgs_table(conn, spec)?;
+        conn.execute_batch("INSERT INTO msgs(msgs) VALUES('rebuild');")?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![FTS_TOKENIZER_META_KEY, spec],
+        )?;
+        Ok(true)
+    })();
+    match outcome {
+        Ok(changed) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(changed)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
 fn create_cache_schema(conn: &Connection) -> Result<()> {
+    create_meta_schema(conn)?;
+    let spec = tokenizer_spec(conn)?;
+    create_cache_schema_with_tokenizer(conn, &spec)
+}
+
+fn create_cache_schema_with_tokenizer(conn: &Connection, tokenizer: &str) -> Result<()> {
+    let msgs_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'msgs')",
+        [],
+        |row| row.get(0),
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS files(
             path       TEXT PRIMARY KEY,
@@ -216,8 +334,8 @@ fn create_cache_schema(conn: &Connection) -> Result<()> {
             archived_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
-        -- Plain rows + external-content FTS. Deleting a session is an
-        -- indexed lookup here; with session_id stored UNINDEXED inside the
+        -- Plain transcript rows + external-content FTS. Deleting a session is
+        -- an indexed lookup here; with session_id stored UNINDEXED inside the
         -- FTS table it was a full scan per file, which made re-index runs
         -- quadratic in practice.
         CREATE TABLE IF NOT EXISTS messages(
@@ -227,12 +345,6 @@ fn create_cache_schema(conn: &Connection) -> Result<()> {
             text       TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-        CREATE VIRTUAL TABLE IF NOT EXISTS msgs USING fts5(
-            text,
-            content='messages',
-            content_rowid='id',
-            tokenize='trigram'
-        );
         CREATE TABLE IF NOT EXISTS summaries(
             session_id TEXT PRIMARY KEY,
             summary    TEXT NOT NULL,
@@ -284,8 +396,6 @@ fn create_cache_schema(conn: &Connection) -> Result<()> {
             PRIMARY KEY (session_id, path)
         );
         CREATE INDEX IF NOT EXISTS idx_touched_path ON touched(path);
-        -- Durable key/value scratchpad. Holds `durable_version` (the durable-
-        -- schema version, separate from user_version). Never dropped.
         -- Evidence layer over `touched`: the concrete edits (kind + a bounded
         -- snippet of the change) behind each touched path. A log - multiple rows
         -- per (session, path) - so the whole change history of a file survives.
@@ -300,12 +410,41 @@ fn create_cache_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_edits_path ON edits(path);
         CREATE INDEX IF NOT EXISTS idx_edits_session ON edits(session_id);
-        CREATE TABLE IF NOT EXISTS meta(
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );",
+        ",
     )?;
+    create_msgs_table(conn, tokenizer)?;
+    if !msgs_exists {
+        conn.execute_batch("INSERT INTO msgs(msgs) VALUES('rebuild');")?;
+    }
     Ok(())
+}
+
+fn cache_schema_needs_work(conn: &Connection) -> Result<bool> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Ok(true);
+    }
+    for table in [
+        "files",
+        "messages",
+        "summaries",
+        "tags",
+        "notes",
+        "archive",
+        "touched",
+        "edits",
+        "msgs",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -377,25 +516,43 @@ pub fn open() -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    let bumped = version != SCHEMA_VERSION;
-    if bumped {
-        // Drop only the derived cache. The durable tables (summaries, tags,
-        // notes, archive) are never dropped: rebuilding the index is cheap,
-        // re-running an LLM or recovering a session the tool already deleted is
-        // not. Archived sessions are rehydrated into the cache below.
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS msgs;
-             DROP TABLE IF EXISTS messages;
-             DROP TABLE IF EXISTS touched;
-             DROP TABLE IF EXISTS files;
-             DROP TABLE IF EXISTS edits;",
-        )?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    create_meta_schema(&conn)?;
+    if cache_schema_needs_work(&conn)? {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let cache_setup = (|| -> Result<()> {
+            // Another opener may have repaired the schema while this one waited
+            // for the lock, so avoid DDL if the cache is current now.
+            if cache_schema_needs_work(&conn)? {
+                let tokenizer = tokenizer_spec(&conn)?;
+                let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                if version != SCHEMA_VERSION {
+                    // Drop only the derived cache. The durable tables (summaries, tags,
+                    // notes, archive) are never dropped: rebuilding the index is cheap,
+                    // re-running an LLM or recovering a session the tool already deleted is
+                    // not. Archived sessions are rehydrated into the cache below.
+                    conn.execute_batch(
+                        "DROP TABLE IF EXISTS msgs;
+                         DROP TABLE IF EXISTS messages;
+                         DROP TABLE IF EXISTS touched;
+                         DROP TABLE IF EXISTS files;
+                         DROP TABLE IF EXISTS edits;",
+                    )?;
+                    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                }
+                create_cache_schema_with_tokenizer(&conn, &tokenizer)?;
+            }
+            Ok(())
+        })();
+        match cache_setup {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
     }
-    create_cache_schema(&conn)?;
     // Durable-table versioning, independent of user_version (the cache). `meta`
-    // exists from the CREATE batch above.
+    // was opened before any cache schema changes above.
     let durable = read_or_init_durable_version(&conn)?;
     let latest = DURABLE_MIGRATIONS
         .iter()
@@ -547,6 +704,7 @@ fn rehydrate_archive(conn: &Connection) -> Result<()> {
                 // so this is where archived Korean sessions become NFC again.
                 // Also redact - a pre-redaction archive holds raw secrets.
                 let text = crate::redact::redact(&crate::util::nfc(text)).into_owned();
+                // External-content FTS requires byte-identical message text.
                 ins_row.execute(params![a.session_id, role, text])?;
                 ins_fts.execute(params![conn.last_insert_rowid(), text])?;
             }
@@ -622,10 +780,10 @@ fn index_one(
             tx.prepare_cached("INSERT INTO messages(session_id, role, text) VALUES (?1,?2,?3)")?;
         let mut ins_fts = tx.prepare_cached("INSERT INTO msgs(rowid, text) VALUES (?1,?2)")?;
         for m in &session.messages {
-            // Normalize once and reuse for the plain row and the external-content
-            // FTS row: they MUST be byte-identical or delete_session_msgs corrupts.
-            // Strip secrets before they enter the index (which outlives the
-            // original session via archive mode). Redact then reuse for both rows.
+            // Normalize once and reuse for the plain row and external-content
+            // FTS row: they MUST be byte-identical or FTS delete/rebuild corrupts.
+            // Strip secrets before they enter the index, which outlives the
+            // original session in archive mode.
             let text = crate::redact::redact(&crate::util::nfc(&m.text)).into_owned();
             ins_row.execute(params![session.id, m.role.label(), text])?;
             ins_fts.execute(params![tx.last_insert_rowid(), text])?;
@@ -1308,8 +1466,89 @@ pub struct Hit {
     pub snippet: String,
 }
 
-/// Full-text search, best match per session. The trigram tokenizer gives
-/// substring matching, which also makes CJK text searchable.
+#[derive(Clone)]
+struct SearchTerm {
+    text: String,
+}
+
+/// Split user text into whitespace-separated terms, keeping quoted text as one
+/// phrase. An unmatched opening quote consumes the remainder of the query.
+fn parse_search_terms(query: &str) -> Vec<SearchTerm> {
+    fn push(terms: &mut Vec<SearchTerm>, text: String) {
+        if !text.trim().is_empty() {
+            terms.push(SearchTerm { text });
+        }
+    }
+
+    let normalized = crate::util::nfc(query);
+    let mut chars = normalized.chars().peekable();
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut phrase = String::new();
+    let mut in_phrase = false;
+
+    while let Some(ch) = chars.next() {
+        if in_phrase {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    phrase.push('"');
+                } else {
+                    push(&mut terms, std::mem::take(&mut phrase));
+                    in_phrase = false;
+                }
+            } else {
+                phrase.push(ch);
+            }
+        } else if ch == '"' {
+            if !current.is_empty() {
+                push(&mut terms, std::mem::take(&mut current));
+            }
+            in_phrase = true;
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                push(&mut terms, std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if in_phrase {
+        push(&mut terms, phrase);
+    } else if !current.is_empty() {
+        push(&mut terms, current);
+    }
+    terms
+}
+
+/// Return an MCP query rejection, if any. Trigram would otherwise let a remote
+/// client trigger the bounded LIKE scan with a query made only of short terms;
+/// word tokenizers can handle those terms directly in FTS.
+pub fn mcp_search_guard(conn: &Connection, query: &str) -> Result<Option<&'static str>> {
+    let terms = parse_search_terms(query);
+    if terms.is_empty() {
+        return Ok(Some("query must contain at least one search term"));
+    }
+    if is_trigram_tokenizer(&tokenizer_spec(conn)?)
+        && !terms.iter().any(|term| term.text.chars().count() >= 3)
+    {
+        return Ok(Some(
+            "trigram search requires at least one term of 3 or more characters",
+        ));
+    }
+    Ok(None)
+}
+
+fn is_trigram_tokenizer(spec: &str) -> bool {
+    spec.split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("trigram"))
+}
+
+/// Search each message for every query term, then return its best session hit.
+/// Terms are ANDed in one message; double quotes keep their contents together
+/// as a phrase. Trigram supports substring and CJK searches; other configured
+/// tokenizers use their own word-search behavior.
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -1317,19 +1556,57 @@ pub fn search(
     tool: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<Hit>> {
-    // A plain quoted string disables FTS5 operator parsing: users type
-    // text, not query syntax.
-    // Normalize the query to NFC so it lines up with the NFC-normalized indexed
-    // text, then quote (the quoting is FTS5 syntax we add, not user content).
-    let fts_query = format!("\"{}\"", crate::util::nfc(query).replace('"', "\"\""));
+    let terms = parse_search_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let trigram = is_trigram_tokenizer(&tokenizer_spec(conn)?);
+    if trigram && terms.iter().all(|term| term.text.chars().count() < 3) {
+        return search_like_terms(conn, &terms, limit, tool, project);
+    }
+    let fts_terms: Vec<SearchTerm> = if trigram {
+        terms
+            .iter()
+            .filter(|term| term.text.chars().count() >= 3)
+            .cloned()
+            .collect()
+    } else {
+        // unicode61, porter, and ascii tokenize punctuation as separators. A
+        // punctuation-only phrase has no FTS tokens and must not form an empty
+        // MATCH phrase. Dropping it also makes an all-punctuation query empty.
+        terms
+            .iter()
+            .filter(|term| term.text.chars().any(char::is_alphanumeric))
+            .cloned()
+            .collect()
+    };
+    if fts_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    search_fts_terms(conn, &terms, &fts_terms, trigram, limit, tool, project)
+}
 
-    // snippet()/rank only work in a plain FTS5 query context, not under
-    // joins or GROUP BY, so match in a subquery and attach metadata outside.
+fn search_fts_terms(
+    conn: &Connection,
+    terms: &[SearchTerm],
+    fts_terms: &[SearchTerm],
+    trigram: bool,
+    limit: usize,
+    tool: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<Hit>> {
+    let fts_query = fts_terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.text.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // snippet()/rank only work in a plain FTS5 query context, not under joins
+    // or GROUP BY, so match in a subquery and attach metadata outside.
     //
-    // Tradeoff: we take the top 1000 message hits by rank, then group to
-    // sessions. For a very common term this can miss sessions whose only hits
-    // fall past rank 1000 - a deliberate choice that keeps the query fast on a
-    // multi-million-message index. Narrow the query to surface the long tail.
+    // Tradeoff: only the top 4000 matching messages by rank reach grouping.
+    // A very common query can omit sessions whose matches rank below that cap;
+    // narrowing the terms surfaces the long tail.
     let mut sql = String::from(
         "SELECT f.session_id, f.tool, f.path, f.project, f.title, f.started, f.msg_count, f.kind,
                 m.role, x.snip, min(x.rank) AS best, (f.archived_at IS NOT NULL)
@@ -1341,89 +1618,13 @@ pub fn search(
          JOIN files f ON f.session_id = m.session_id
          WHERE 1=1",
     );
-    let mut args: Vec<String> = vec![fts_query];
-    if let Some(t) = tool {
-        sql.push_str(" AND f.tool = ?");
-        args.push(t.to_string());
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+    if trigram {
+        for term in terms.iter().filter(|term| term.text.chars().count() < 3) {
+            sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
+            args.push(Box::new(format!("%{}%", escape_like(&term.text))));
+        }
     }
-    if let Some(p) = project {
-        sql.push_str(" AND f.project LIKE ?");
-        args.push(format!("%{}%", crate::util::nfc(p)));
-    }
-    sql.push_str(&format!(
-        " GROUP BY f.session_id ORDER BY best LIMIT {limit}"
-    ));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
-        Ok(Hit {
-            row: SessionRow {
-                last_active: None,
-                session_id: r.get(0)?,
-                tool: r.get(1)?,
-                path: r.get(2)?,
-                project: r.get(3)?,
-                title: r.get(4)?,
-                started: r.get(5)?,
-                msg_count: r.get(6)?,
-                kind: r.get(7)?,
-                preview: None,
-                summary: None,
-                tags: None,
-                archived: r.get(11)?,
-                account: None,
-            },
-            role: r.get(8)?,
-            snippet: r.get(9)?,
-        })
-    })?;
-    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    crate::account_link::annotate(out.iter_mut().map(|h| &mut h.row));
-    Ok(out)
-}
-
-/// Substring search for queries too short for the trigram FTS index (1-2
-/// chars, e.g. the Korean words 회사 / 검색). The trigram tokenizer needs >=3
-/// chars, so these terms are unindexable; we fall back to a LIKE scan of
-/// messages.text. Returns the same `Hit` shape as `search` so callers are
-/// agnostic to which path ran.
-///
-/// Perf: this is a table scan, used ONLY for short queries (the >=3 path stays
-/// on FTS). We cap the candidate rows scanned (SCAN_CAP) ordered newest-first
-/// so a very common 2-char term cannot walk an unbounded table; the tradeoff is
-/// that a session whose only match is older than the newest SCAN_CAP hits can be
-/// missed. Narrow to a >=3-char term to use the exact FTS path instead. LIKE has
-/// no rank, so results are ordered by recency (newest session first).
-pub fn search_like(
-    conn: &Connection,
-    query: &str,
-    limit: usize,
-    tool: Option<&str>,
-    project: Option<&str>,
-) -> Result<Vec<Hit>> {
-    const SCAN_CAP: i64 = 50_000;
-
-    // NFC so a decomposed query (macOS Korean) matches NFC-stored text, then
-    // escape LIKE metacharacters ('\' first so an escape char is literal).
-    let q = crate::util::nfc(query.trim());
-    let pattern = format!(
-        "%{}%",
-        q.replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    );
-
-    let mut sql = String::from(
-        "SELECT f.session_id, f.tool, f.path, f.project, f.title, f.started, f.msg_count, f.kind,
-                x.role, x.text, (f.archived_at IS NOT NULL)
-         FROM (SELECT m.session_id AS sid, m.role AS role, m.text AS text, m.id AS mid
-               FROM messages m
-               WHERE m.text LIKE ?1 ESCAPE '\\'
-               ORDER BY m.id DESC LIMIT ?2) x
-         JOIN files f ON f.session_id = x.sid
-         WHERE 1=1",
-    );
-    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(pattern), Box::new(SCAN_CAP)];
     if let Some(t) = tool {
         sql.push_str(" AND f.tool = ?");
         args.push(Box::new(t.to_string()));
@@ -1432,16 +1633,106 @@ pub fn search_like(
         sql.push_str(" AND f.project LIKE ?");
         args.push(Box::new(format!("%{}%", crate::util::nfc(p))));
     }
-    // One row per session (its newest matching message), sessions newest-first.
+    sql.push_str(&format!(
+        " GROUP BY f.session_id ORDER BY best LIMIT {limit}"
+    ));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())),
+        |r| {
+            Ok(Hit {
+                row: SessionRow {
+                    last_active: None,
+                    session_id: r.get(0)?,
+                    tool: r.get(1)?,
+                    path: r.get(2)?,
+                    project: r.get(3)?,
+                    title: r.get(4)?,
+                    started: r.get(5)?,
+                    msg_count: r.get(6)?,
+                    kind: r.get(7)?,
+                    preview: None,
+                    summary: None,
+                    tags: None,
+                    archived: r.get(11)?,
+                    account: None,
+                },
+                role: r.get(8)?,
+                snippet: r.get(9)?,
+            })
+        },
+    )?;
+    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    crate::account_link::annotate(out.iter_mut().map(|hit| &mut hit.row));
+    Ok(out)
+}
+
+/// Substring search for terms below the trigram tokenizer's three-character
+/// floor. All terms must match the same messages.text row.
+///
+/// Perf: SQLite scans messages to find matching rows, then the newest 50,000
+/// matches reach session grouping. A session with no match among those newest
+/// candidates can be missed. With trigram, the unified search dispatcher uses
+/// this only when every term is short; any longer term stays on FTS. Other
+/// tokenizer specs use FTS for short terms too. LIKE has no rank, so results
+/// are ordered by recency.
+pub fn search_like(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    tool: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<Hit>> {
+    let terms = parse_search_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    search_like_terms(conn, &terms, limit, tool, project)
+}
+
+fn search_like_terms(
+    conn: &Connection,
+    terms: &[SearchTerm],
+    limit: usize,
+    tool: Option<&str>,
+    project: Option<&str>,
+) -> Result<Vec<Hit>> {
+    const SCAN_CAP: i64 = 50_000;
+
+    let mut sql = String::from(
+        "SELECT f.session_id, f.tool, f.path, f.project, f.title, f.started, f.msg_count, f.kind,
+                x.role, x.text, (f.archived_at IS NOT NULL)
+         FROM (SELECT m.session_id AS sid, m.role AS role, m.text AS text, m.id AS mid
+               FROM messages m WHERE 1=1",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    for term in terms {
+        sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
+        args.push(Box::new(format!("%{}%", escape_like(&term.text))));
+    }
+    sql.push_str(" ORDER BY m.id DESC LIMIT ?)");
+    args.push(Box::new(SCAN_CAP));
+    sql.push_str(
+        " x JOIN files f ON f.session_id = x.sid
+         WHERE 1=1",
+    );
+    if let Some(t) = tool {
+        sql.push_str(" AND f.tool = ?");
+        args.push(Box::new(t.to_string()));
+    }
+    if let Some(p) = project {
+        sql.push_str(" AND f.project LIKE ?");
+        args.push(Box::new(format!("%{}%", crate::util::nfc(p))));
+    }
     sql.push_str(&format!(
         " GROUP BY f.session_id ORDER BY max(x.mid) DESC LIMIT {limit}"
     ));
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        rusqlite::params_from_iter(args.iter().map(|b| b.as_ref())),
+        rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref())),
         |r| {
-            let role: String = r.get(8)?;
             let text: String = r.get(9)?;
             Ok(Hit {
                 row: SessionRow {
@@ -1460,54 +1751,81 @@ pub fn search_like(
                     archived: r.get(10)?,
                     account: None,
                 },
-                role,
-                snippet: snippet_around(&text, &q),
+                role: r.get(8)?,
+                snippet: snippet_around(&text, terms),
             })
         },
     )?;
     let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    crate::account_link::annotate(out.iter_mut().map(|h| &mut h.row));
+    crate::account_link::annotate(out.iter_mut().map(|hit| &mut hit.row));
     Ok(out)
 }
 
-/// Build a snippet for a LIKE hit: a window around the first (case-insensitive,
-/// NFC) match of `needle` in `text`, with the match wrapped in \u{2}..\u{3} -
-/// the same delimiters snippet() emits - so the CLI's ANSI swap and the web UI
-/// render LIKE hits identically to FTS hits. Matching is on chars, not bytes,
-/// so multibyte CJK is never sliced mid-codepoint.
-fn snippet_around(text: &str, needle: &str) -> String {
+/// Build a short raw-text window around the first LIKE term, highlighting every
+/// term occurrence in that window. Matching folds case, while a character map
+/// keeps highlights aligned to the unmodified transcript.
+fn snippet_around(text: &str, terms: &[SearchTerm]) -> String {
     const WINDOW: usize = 36;
-    let hay_chars: Vec<char> = text.to_lowercase().chars().collect();
-    let nee_chars: Vec<char> = needle.to_lowercase().chars().collect();
     let chars: Vec<char> = text.chars().collect();
+    let mut folded = Vec::new();
+    let mut source = Vec::new();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        for lower in ch.to_lowercase() {
+            folded.push(lower);
+            source.push((index, index + 1));
+        }
+    }
 
-    let match_at = if nee_chars.is_empty() {
-        None
-    } else {
-        hay_chars
-            .windows(nee_chars.len())
-            .position(|w| w == nee_chars.as_slice())
-    };
-    let Some(start) = match_at else {
+    let mut matches = Vec::new();
+    for term in terms {
+        let needle: Vec<char> = term.text.chars().flat_map(char::to_lowercase).collect();
+        if needle.is_empty() || needle.len() > folded.len() {
+            continue;
+        }
+        for start in 0..=folded.len() - needle.len() {
+            let end = start + needle.len();
+            if folded[start..end] == needle[..] {
+                matches.push((source[start].0, source[end - 1].1));
+            }
+        }
+    }
+
+    let Some(&(anchor_start, anchor_end)) = matches.iter().min_by_key(|range| range.0) else {
         return chars
             .iter()
             .take(WINDOW * 2)
             .collect::<String>()
             .replace('\n', " ");
     };
-    let end = start + nee_chars.len();
-    let lo = start.saturating_sub(WINDOW);
-    let hi = (end + WINDOW).min(chars.len());
+    let lo = anchor_start.saturating_sub(WINDOW);
+    let hi = (anchor_end + WINDOW).min(chars.len());
+    matches.retain(|(start, end)| *start >= lo && *end <= hi);
+    matches.sort_unstable();
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in matches {
+        if let Some(previous) = ranges.last_mut() {
+            if start < previous.1 {
+                previous.1 = previous.1.max(end);
+                continue;
+            }
+        }
+        ranges.push((start, end));
+    }
 
     let mut out = String::new();
     if lo > 0 {
         out.push('\u{2026}');
     }
-    out.extend(&chars[lo..start]);
-    out.push('\u{2}');
-    out.extend(&chars[start..end]);
-    out.push('\u{3}');
-    out.extend(&chars[end..hi]);
+    let mut cursor = lo;
+    for (start, end) in ranges {
+        out.extend(&chars[cursor..start]);
+        out.push('\u{2}');
+        out.extend(&chars[start..end]);
+        out.push('\u{3}');
+        cursor = end;
+    }
+    out.extend(&chars[cursor..hi]);
     if hi < chars.len() {
         out.push('\u{2026}');
     }
