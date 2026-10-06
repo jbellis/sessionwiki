@@ -229,6 +229,16 @@ pub fn list(
     Ok(())
 }
 
+pub struct SearchOptions<'a> {
+    pub limit: usize,
+    pub tool: Option<&'a str>,
+    pub project: Option<&'a str>,
+    pub account: Option<&'a str>,
+    pub json: bool,
+    pub no_sync: bool,
+    pub roles: Option<&'a [Role]>,
+}
+
 pub fn search(
     query: &str,
     limit: usize,
@@ -238,6 +248,30 @@ pub fn search(
     json: bool,
     no_sync: bool,
 ) -> Result<()> {
+    search_with_options(
+        query,
+        SearchOptions {
+            limit,
+            tool,
+            project,
+            account,
+            json,
+            no_sync,
+            roles: None,
+        },
+    )
+}
+
+pub fn search_with_options(query: &str, options: SearchOptions<'_>) -> Result<()> {
+    let SearchOptions {
+        limit,
+        tool,
+        project,
+        account,
+        json,
+        no_sync,
+        roles,
+    } = options;
     let trimmed = query.trim();
     if trimmed.is_empty() {
         bail!("empty query");
@@ -246,7 +280,7 @@ pub fn search(
     if !no_sync {
         index::sync(&mut conn, tool)?;
     }
-    let mut hits = index::search(&conn, trimmed, limit, tool, project)?;
+    let mut hits = index::search_with_roles(&conn, trimmed, limit, tool, project, roles)?;
     if let Some(a) = account {
         hits.retain(|h| h.row.account.as_deref() == Some(a));
         // (search relevance already ordered; post-filter keeps the top matches)

@@ -139,7 +139,7 @@ GB). After that, updates are incremental and take seconds.
 |---|---|
 | `scan` | Discover session stores on this machine. Pure filesystem walk, instant. |
 | `list` | Recent sessions across all tools in one timeline. `--tool codex`, `--project api`, `--tag spike`, `-n 50`, `--all` (include subagent transcripts). |
-| `search <query>` | Search every message across tools. Terms are ANDed within one message; double quotes mark a phrase. Matching depends on the configured tokenizer (see `tokenizer`). |
+| `search <query>` | Search every message across tools. Terms are ANDed within one message; double quotes mark a phrase. Use `--role user,assistant` to search only the conversation, excluding tool output. Matching depends on the configured tokenizer (see `tokenizer`). |
 | `tokenizer [SPEC]` | Show the current FTS5 tokenizer, or set one and rebuild only the search index. |
 | `recall <query>` | Search, list the matches, and brief the top one in a single command &mdash; the fastest way back into a past session. `--tool`, `--project`, `-n`, `--json` (for agents). |
 | `show <id>` | One session as a readable transcript. `--full` expands tool calls, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |

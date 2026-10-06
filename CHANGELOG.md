@@ -6,6 +6,13 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Search can filter by message role.** `--role user,assistant` limits matches
+  to conversation messages before ranking and grouping, so tool output cannot
+  crowd conversational matches out of search results. The web search and MCP
+  search accept the same role filter.
+
 ## [0.31.0] - 2026-10-06
 
 ### Added

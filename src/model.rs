@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,6 +17,19 @@ impl Role {
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
+        }
+    }
+}
+
+impl FromStr for Role {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "user" => Ok(Role::User),
+            "assistant" => Ok(Role::Assistant),
+            "tool" => Ok(Role::Tool),
+            _ => Err("role must be user, assistant, or tool"),
         }
     }
 }

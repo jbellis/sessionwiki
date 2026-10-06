@@ -20,6 +20,10 @@ fn fresh_index() -> (Connection, PathBuf) {
 }
 
 fn seed_message(conn: &Connection, id: &str, text: &str) {
+    seed_role_message(conn, id, Role::User, text);
+}
+
+fn seed_role_message(conn: &Connection, id: &str, role: Role, text: &str) {
     conn.execute(
         "INSERT OR REPLACE INTO files
          (path, mtime, size, session_id, tool, project, title, started, ended, msg_count, kind)
@@ -29,8 +33,8 @@ fn seed_message(conn: &Connection, id: &str, text: &str) {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO messages(session_id, role, text) VALUES (?1, 'user', ?2)",
-        params![id, text],
+        "INSERT INTO messages(session_id, role, text) VALUES (?1, ?2, ?3)",
+        params![id, role.label(), text],
     )
     .unwrap();
     let message_id = conn.last_insert_rowid();
@@ -39,6 +43,151 @@ fn seed_message(conn: &Connection, id: &str, text: &str) {
         params![message_id, text],
     )
     .unwrap();
+}
+
+#[test]
+fn role_filter_excludes_tool_only_matches_and_leaves_default_search_unchanged() {
+    let _guard = LOCK.lock().unwrap();
+    let (conn, _) = fresh_index();
+    seed_role_message(
+        &conn,
+        "tool-only",
+        Role::Tool,
+        "unique needle from command output",
+    );
+
+    let hits = index::search(&conn, "unique needle", 10, None, None).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].role, "tool");
+
+    let conversation = [Role::User, Role::Assistant];
+    assert!(
+        index::search_with_roles(&conn, "unique needle", 10, None, None, Some(&conversation),)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn role_filter_returns_the_best_allowed_message_for_each_session() {
+    let _guard = LOCK.lock().unwrap();
+    let (conn, _) = fresh_index();
+    seed_role_message(&conn, "mixed-roles", Role::Tool, "beacon");
+    seed_role_message(&conn, "mixed-roles", Role::Assistant, "assistant beacon");
+
+    let unfiltered = index::search(&conn, "beacon", 10, None, None).unwrap();
+    assert_eq!(unfiltered[0].role, "tool");
+
+    let conversation = [Role::User, Role::Assistant];
+    let hits =
+        index::search_with_roles(&conn, "beacon", 10, None, None, Some(&conversation)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].row.session_id, "mixed-roles");
+    assert_eq!(hits[0].role, "assistant");
+    assert!(
+        hits[0].snippet.contains("assistant"),
+        "{:?}",
+        hits[0].snippet
+    );
+}
+
+#[test]
+fn role_filter_runs_before_the_fts_candidate_cap() {
+    let _guard = LOCK.lock().unwrap();
+    let (mut conn, _) = fresh_index();
+    let tx = conn.transaction().unwrap();
+    let mut insert_file = tx
+        .prepare_cached(
+            "INSERT INTO files
+             (path, mtime, size, session_id, tool, project, title, started, ended, msg_count, kind)
+             VALUES (?1, 0, 0, ?2, 'codex', '/search', ?2, '2026-06-10T10:00:00+00:00',
+                     '2026-06-10T10:00:00+00:00', 1, 'main')",
+        )
+        .unwrap();
+    let mut insert_message = tx
+        .prepare_cached(
+            "INSERT INTO messages(session_id, role, text) VALUES (?1, 'tool', 'rankneedle')",
+        )
+        .unwrap();
+    let mut insert_fts = tx
+        .prepare_cached("INSERT INTO msgs(rowid, text) VALUES (?1, 'rankneedle')")
+        .unwrap();
+    for n in 0..4_001 {
+        let id = format!("tool-overflow-{n:04}");
+        insert_file
+            .execute(params![format!("/fake/{id}.jsonl"), id])
+            .unwrap();
+        insert_message.execute(params![id]).unwrap();
+        insert_fts.execute(params![tx.last_insert_rowid()]).unwrap();
+    }
+    drop(insert_fts);
+    drop(insert_message);
+    drop(insert_file);
+    tx.commit().unwrap();
+
+    let long_context = format!("{}rankneedle", "background ".repeat(500));
+    seed_role_message(&conn, "assistant-after-cap", Role::Assistant, &long_context);
+
+    let unfiltered = index::search(&conn, "rankneedle", 10, None, None).unwrap();
+    assert!(unfiltered
+        .iter()
+        .all(|hit| hit.row.session_id != "assistant-after-cap"));
+
+    let assistant = [Role::Assistant];
+    let filtered =
+        index::search_with_roles(&conn, "rankneedle", 10, None, None, Some(&assistant)).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].row.session_id, "assistant-after-cap");
+}
+
+#[test]
+fn role_filter_applies_to_the_short_term_like_path() {
+    let _guard = LOCK.lock().unwrap();
+    let (conn, _) = fresh_index();
+    seed_role_message(
+        &conn,
+        "short-term",
+        Role::Assistant,
+        "xy in the assistant reply",
+    );
+    seed_role_message(&conn, "short-term", Role::Tool, "xy in newer tool output");
+
+    let assistant = [Role::Assistant];
+    let hits = index::search_with_roles(&conn, "xy", 10, None, None, Some(&assistant)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].role, "assistant");
+    assert!(hits[0].snippet.contains("assistant reply"));
+}
+
+#[test]
+fn cli_rejects_roles_the_index_does_not_store() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sessionwiki"))
+        .args(["search", "needle", "--role", "system", "--no-sync"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("role must be user, assistant, or tool"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cli_accepts_comma_separated_search_roles() {
+    let data = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sessionwiki"))
+        .args(["search", "needle", "--role", "user,assistant", "--no-sync"])
+        .env("SESSIONWIKI_DATA", data.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

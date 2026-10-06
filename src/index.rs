@@ -1,4 +1,5 @@
 use crate::adapters::{self, Adapter};
+use crate::model::Role;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -1556,13 +1557,35 @@ pub fn search(
     tool: Option<&str>,
     project: Option<&str>,
 ) -> Result<Vec<Hit>> {
+    search_with_roles(conn, query, limit, tool, project, None)
+}
+
+/// Search messages and return each session's best matching hit, optionally
+/// restricted to the supplied message roles. The role restriction is applied
+/// before the candidate cap and before sessions are grouped.
+pub fn search_with_roles(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    tool: Option<&str>,
+    project: Option<&str>,
+    roles: Option<&[Role]>,
+) -> Result<Vec<Hit>> {
+    if roles.is_some_and(|roles| roles.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let filters = SearchFilters {
+        tool,
+        project,
+        roles,
+    };
     let terms = parse_search_terms(query);
     if terms.is_empty() {
         return Ok(Vec::new());
     }
     let trigram = is_trigram_tokenizer(&tokenizer_spec(conn)?);
     if trigram && terms.iter().all(|term| term.text.chars().count() < 3) {
-        return search_like_terms(conn, &terms, limit, tool, project);
+        return search_like_terms(conn, &terms, limit, filters);
     }
     let fts_terms: Vec<SearchTerm> = if trigram {
         terms
@@ -1583,7 +1606,14 @@ pub fn search(
     if fts_terms.is_empty() {
         return Ok(Vec::new());
     }
-    search_fts_terms(conn, &terms, &fts_terms, trigram, limit, tool, project)
+    search_fts_terms(conn, &terms, &fts_terms, trigram, limit, filters)
+}
+
+#[derive(Clone, Copy)]
+struct SearchFilters<'a> {
+    tool: Option<&'a str>,
+    project: Option<&'a str>,
+    roles: Option<&'a [Role]>,
 }
 
 fn search_fts_terms(
@@ -1592,8 +1622,7 @@ fn search_fts_terms(
     fts_terms: &[SearchTerm],
     trigram: bool,
     limit: usize,
-    tool: Option<&str>,
-    project: Option<&str>,
+    filters: SearchFilters<'_>,
 ) -> Result<Vec<Hit>> {
     let fts_query = fts_terms
         .iter()
@@ -1613,23 +1642,40 @@ fn search_fts_terms(
          FROM (SELECT rowid AS mid,
                       snippet(msgs, 0, char(2), char(3), char(8230), 18) AS snip,
                       rank
-               FROM msgs WHERE msgs MATCH ? ORDER BY rank LIMIT 4000) x
+               FROM msgs WHERE msgs MATCH ?",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+    if let Some(roles) = filters.roles {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM messages role_message
+                          WHERE role_message.id = msgs.rowid AND role_message.role IN (",
+        );
+        for (index, role) in roles.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+            args.push(Box::new(role.label().to_string()));
+        }
+        sql.push_str("))");
+    }
+    sql.push_str(
+        " ORDER BY rank LIMIT 4000) x
          JOIN messages m ON m.id = x.mid
          JOIN files f ON f.session_id = m.session_id
          WHERE 1=1",
     );
-    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
     if trigram {
         for term in terms.iter().filter(|term| term.text.chars().count() < 3) {
             sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
             args.push(Box::new(format!("%{}%", escape_like(&term.text))));
         }
     }
-    if let Some(t) = tool {
+    if let Some(t) = filters.tool {
         sql.push_str(" AND f.tool = ?");
         args.push(Box::new(t.to_string()));
     }
-    if let Some(p) = project {
+    if let Some(p) = filters.project {
         sql.push_str(" AND f.project LIKE ?");
         args.push(Box::new(format!("%{}%", crate::util::nfc(p))));
     }
@@ -1688,15 +1734,23 @@ pub fn search_like(
     if terms.is_empty() {
         return Ok(Vec::new());
     }
-    search_like_terms(conn, &terms, limit, tool, project)
+    search_like_terms(
+        conn,
+        &terms,
+        limit,
+        SearchFilters {
+            tool,
+            project,
+            roles: None,
+        },
+    )
 }
 
 fn search_like_terms(
     conn: &Connection,
     terms: &[SearchTerm],
     limit: usize,
-    tool: Option<&str>,
-    project: Option<&str>,
+    filters: SearchFilters<'_>,
 ) -> Result<Vec<Hit>> {
     const SCAN_CAP: i64 = 50_000;
 
@@ -1707,6 +1761,17 @@ fn search_like_terms(
                FROM messages m WHERE 1=1",
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(roles) = filters.roles {
+        sql.push_str(" AND m.role IN (");
+        for (index, role) in roles.iter().enumerate() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+            args.push(Box::new(role.label().to_string()));
+        }
+        sql.push(')');
+    }
     for term in terms {
         sql.push_str(" AND m.text LIKE ? ESCAPE '\\'");
         args.push(Box::new(format!("%{}%", escape_like(&term.text))));
@@ -1717,11 +1782,11 @@ fn search_like_terms(
         " x JOIN files f ON f.session_id = x.sid
          WHERE 1=1",
     );
-    if let Some(t) = tool {
+    if let Some(t) = filters.tool {
         sql.push_str(" AND f.tool = ?");
         args.push(Box::new(t.to_string()));
     }
-    if let Some(p) = project {
+    if let Some(p) = filters.project {
         sql.push_str(" AND f.project LIKE ?");
         args.push(Box::new(format!("%{}%", crate::util::nfc(p))));
     }
