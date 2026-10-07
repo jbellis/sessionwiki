@@ -63,6 +63,10 @@ pub fn index_checks(conn: &Connection, expected_schema: i64) -> Vec<Check> {
         Ok(spec) => Check::ok("search tokenizer", spec),
         Err(e) => Check::warn("search tokenizer", format!("unavailable: {e}")),
     });
+    checks.push(match crate::index::tool_output_mode(conn) {
+        Ok(mode) => Check::ok("tool output storage", mode.to_string()),
+        Err(e) => Check::warn("tool output storage", format!("unavailable: {e}")),
+    });
 
     // Real reads of each core table: a query error is a genuine problem (missing
     // table, lock, read-corruption), never a healthy empty index - so it must not
@@ -266,6 +270,12 @@ mod tests {
             .unwrap();
         assert_eq!(tokenizer.status, Status::Ok);
         assert_eq!(tokenizer.detail, "trigram");
+        let tool_output = checks
+            .iter()
+            .find(|c| c.name == "tool output storage")
+            .unwrap();
+        assert_eq!(tool_output.status, Status::Ok);
+        assert_eq!(tool_output.detail, "full");
         let tables = checks.iter().find(|c| c.name == "index tables").unwrap();
         assert_eq!(tables.status, Status::Ok, "all core tables readable");
         let sessions = checks

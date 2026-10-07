@@ -211,10 +211,10 @@ fn discover_history(roots: &[PathBuf], guarded: &[&str]) -> (Vec<PathBuf>, bool)
             .follow_links(false) // never escape via symlinks (first walk over user space)
             .into_iter()
             .filter_entry(|e| {
-                !is_skipped(e)
-                    && !(e.depth() == 1
+                !(is_skipped(e)
+                    || (e.depth() == 1
                         && e.file_type().is_dir()
-                        && e.file_name().to_str().is_some_and(|n| guarded.contains(&n)))
+                        && e.file_name().to_str().is_some_and(|n| guarded.contains(&n))))
             });
         for entry in walker {
             if start.elapsed().as_secs() >= WALK_BUDGET_SECS {

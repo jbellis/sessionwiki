@@ -153,12 +153,13 @@ GB). After that, updates are incremental and take seconds.
 | `list` | Recent sessions across all tools in one timeline. `--tool codex`, `--project api`, `--tag spike`, `-n 50`, `--all` (include subagent transcripts). |
 | `search <query>` | Search every message across tools. Terms are ANDed within one message; double quotes mark a phrase. Use `--role user,assistant` to search only the conversation, excluding tool output. Matching depends on the configured tokenizer (see `tokenizer`). |
 | `tokenizer [SPEC]` | Show the current FTS5 tokenizer, or set one and rebuild only the search index. |
+| `tool-output [MODE]` | Show or change whether full tool results are retained in this index. `full` is the default; `summary` removes stored results for live sessions. |
 | `recall <query>` | Search, list the matches, and brief the top one in a single command &mdash; the fastest way back into a past session. `--tool`, `--project`, `-n`, `--json` (for agents). |
-| `show <id>` | One session as a readable transcript with compact tool summaries. `--full` appends bounded tool output from live files, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
+| `show <id>` | One session as a readable transcript with compact tool summaries. `--full` appends bounded tool output from the live file or index, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
 | `summarize [id]` | 1&ndash;2 sentence synopses via **your own LLM CLI** (`claude -p` default; `--cmd` / `SESSIONWIKI_SUMMARIZER` to change), cached in the index and shown in `show`, `--outline`, and the web sidebar. Without an id, batches the `--recent N` newest. |
 | `resume <id>` | Reopen the session in its original tool: `claude --resume` / `codex resume`, run in the right project directory. Subagent transcripts resume their parent. `--print` to just show the command. |
 | `migrate <id> <dir>` | Make a session resumable from a different project directory: Claude Code copies the transcript into `<dir>`'s store, Codex resumes by id from anywhere, Gemini copies the chat over. The original is never touched. `--config-dir <DIR>` writes into a specific store instead of the default one - for a machine where each account has its own (`CLAUDE_CONFIG_DIR` is honoured when the flag is absent). |
-| `brief <id>` | Emit the session as a markdown briefing (head and tail, middle omitted) with compact tool summaries. `--tools` appends bounded output from live files; `--max-chars` sets the briefing budget. |
+| `brief <id>` | Emit the session as a markdown briefing (head and tail, middle omitted) with compact tool summaries. `--tools` appends bounded tool output from the live file or index; `--max-chars` sets the briefing budget. |
 | `web` | Local viewer on `127.0.0.1:7575`: day-grouped sessions, live search with highlighted snippets, rendered transcripts with outlines/tags/related, resume commands, light/dark, UI auto-localized (en/ko/ja/zh). Reads the existing index; `web --sync` refreshes first. Never leaves localhost. |
 | `sync [--tool]` | Build or refresh the index on demand. Pair with `--no-sync` (below) so queries skip the store walk. Handy from a cron to keep the index warm. |
 
@@ -175,6 +176,17 @@ shared by CLI, web, and MCP; changing it rebuilds the FTS table from the
 existing indexed messages without reparsing session files. Quote specs that
 contain spaces, for example `sessionwiki tokenizer 'porter unicode61'` or
 `sessionwiki tokenizer 'unicode61 remove_diacritics 2'`.
+
+Full tool results are retained separately from searchable transcript text by
+default, so `show --full` and `brief --tools` can still read them after a tool
+deletes the source session. The `full` or `summary` choice is stored per index;
+`sessionwiki tool-output summary` clears full results for live sessions, while
+already archived sessions keep their existing output. SQLite space from the
+removed live data can be reclaimed with `VACUUM`. Switching back to `full`
+marks live sessions for re-parsing on the next sync; archived sessions keep the
+data they already have. This per-index setting lets embedders that share the
+index avoid storing full output. Embedders can read or set it with
+`index::tool_output_mode` and `index::set_tool_output_mode`.
 
 ### Session engineering
 
@@ -243,13 +255,16 @@ longer reopen it, but you can still read, `brief`, and `trace` it. This is the
 part a generation-time hook can't do &mdash; it works for the sessions that
 already exist, and the ones the tool deleted while you weren't looking.
 
-**It also reclaims disk.** The index keeps only a distilled copy of each session
+**It also reclaims disk.** The index keeps a distilled copy of each session
 (the conversation and its file links, with tool calls represented by compact
-summary lines rather than bulky output), so it is far
-smaller than the raw stores &mdash; roughly 7&times; on the machine above (47 GB
-&rarr; ~7 GB). Delete the old raw sessions to free the space and `search`,
-`trace`, `brief`, and reading still work from the index. The tradeoff: an
-archived session is the distilled transcript, not the byte-exact original &mdash;
+summary lines). In the default `full` mode it also keeps bounded tool results
+in a separate, non-searchable column; `sessionwiki tool-output summary` clears
+those results for live sessions when storage minimization matters. Previously
+archived sessions retain the results they already contain. The index is far
+smaller than the raw stores &mdash; roughly 7&times; in summary mode on the machine
+above (47 GB &rarr; ~7 GB). Delete the old raw sessions to free the space and
+`search`, `trace`, `brief`, and reading still work from the index. The tradeoff:
+an archived session is the distilled transcript, not the byte-exact original &mdash;
 which is exactly the part you want when you are hunting for the conversation that
 solved something.
 

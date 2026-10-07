@@ -15,12 +15,16 @@ semantic versioning once it reaches 1.0.
   Continue, Gajae, OpenCode) emits structured calls and results, and one shared
   renderer formats them. The line is what `show`, `brief`, the web UI, MCP and
   search see; `brief` now includes tool lines by default, and `--tools`
-  (`brief`) or `--full` (`show`) append bounded output when the original
-  session file is still on disk. Tool output is no longer indexed, so the
-  index shrinks and a string that only appeared mid-output no longer matches a
-  search. Schema v9: existing indexes rebuild once on first use. The first
-  run after upgrading re-parses every session, which can take a while on a
-  large store.
+  (`brief`) or `--full` (`show`) append bounded output. Full output is retained
+  separately from FTS by default, so archive mode preserves it after the source
+  file is deleted. The per-index `sessionwiki tool-output` setting lets
+  embedders opt out of storing full output: `summary` clears it for live
+  sessions, while previously archived sessions keep their existing output.
+  Switching back to `full` marks live sessions for re-parsing.
+  Tool output is no longer indexed, so a string that appeared only mid-output
+  no longer matches a search. Schema v9 rebuilds each existing index once on
+  first use; the first run after upgrading re-parses every session, which can
+  take a while on a large store.
 
 ## [0.33.2] - 2026-10-08
 

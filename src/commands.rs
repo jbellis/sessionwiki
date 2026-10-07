@@ -367,6 +367,32 @@ pub fn tokenizer(spec: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Show or change whether full tool results are retained in this index.
+pub fn tool_output(mode: Option<&str>) -> Result<()> {
+    let conn = index::open()?;
+    match mode {
+        Some(mode) => {
+            let mode = mode
+                .parse::<index::ToolOutputMode>()
+                .map_err(anyhow::Error::msg)?;
+            if index::set_tool_output_mode(&conn, mode)? {
+                match mode {
+                    index::ToolOutputMode::Full => println!(
+                        "Tool output storage set to full; live sessions will be re-parsed on the next sync."
+                    ),
+                    index::ToolOutputMode::Summary => println!(
+                        "Tool output storage set to summary; full output was removed for live sessions. Archived sessions keep their existing output. You may run VACUUM to reclaim disk space."
+                    ),
+                }
+            } else {
+                println!("Tool output storage is already {mode}.");
+            }
+        }
+        None => println!("{}", index::tool_output_mode(&conn)?),
+    }
+    Ok(())
+}
+
 /// Recall in one step: search, list the candidates, and brief the top match.
 /// Collapses the usual search -> eyeball id -> brief loop into one command.
 pub fn recall(

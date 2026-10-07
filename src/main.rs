@@ -72,6 +72,11 @@ enum Command {
         /// FTS5 tokenizer spec; quote values with spaces, e.g. 'porter unicode61'
         spec: Option<String>,
     },
+    /// Show or change whether full tool output is retained in the index
+    ToolOutput {
+        /// Retention mode: `full` (default) or `summary`
+        mode: Option<String>,
+    },
     /// Recall past work in one step: search, then brief the top match
     Recall {
         /// AND-search terms within a message; quote words when they must form a phrase
@@ -361,6 +366,7 @@ fn main() {
             },
         ),
         Command::Tokenizer { spec } => commands::tokenizer(spec.as_deref()),
+        Command::ToolOutput { mode } => commands::tool_output(mode.as_deref()),
         Command::Recall {
             query,
             limit,
