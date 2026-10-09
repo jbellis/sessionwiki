@@ -1,6 +1,6 @@
 use super::{
-    clean_path, dedup_paths, ok_or_flag, parse_ts, redacted_truncate, title_from_messages, Adapter,
-    Discovered,
+    bounded_redacted_output, clean_path, dedup_paths, ok_or_flag, parse_ts, redacted_truncate,
+    title_from_messages, Adapter, Discovered,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
@@ -8,8 +8,6 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// Claude Code stores one JSONL file per session under
 /// `~/.claude/projects/<sanitized-cwd>/<session-uuid>.jsonl`.
@@ -360,15 +358,6 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 #[cfg(test)]

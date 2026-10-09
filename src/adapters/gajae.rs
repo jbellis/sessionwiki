@@ -1,5 +1,6 @@
 use super::{
-    dedup_paths, ok_or_flag, parse_ts, redacted_truncate, title_from_messages, Adapter, Discovered,
+    bounded_redacted_output, dedup_paths, ok_or_flag, parse_ts, redacted_truncate,
+    title_from_messages, Adapter, Discovered,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
@@ -8,8 +9,6 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// gajae-code (가재코드, github Yeachan-Heo/gajae-code) is a Korean terminal
 /// agent built on Mario Zechner's "Pi" (pi-mono); the two share a byte-identical
@@ -284,15 +283,6 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 fn push(messages: &mut Vec<Message>, role: Role, text: &str, ts: Option<DateTime<Utc>>) {

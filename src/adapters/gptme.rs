@@ -1,4 +1,6 @@
-use super::{ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered};
+use super::{
+    bounded_redacted_output, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered,
+};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::Result;
@@ -15,8 +17,6 @@ use walkdir::WalkDir;
 /// startup. A system-role message after an assistant tool block is its result;
 /// unpaired system messages are context injections or compaction notices.
 pub struct Gptme;
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 impl Adapter for Gptme {
     fn name(&self) -> &'static str {
@@ -353,15 +353,6 @@ fn record_time(
         started.get_or_insert(ts);
         *ended = Some(ts);
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 /// gptme uses Python's `datetime.now().isoformat()`, which produces naive

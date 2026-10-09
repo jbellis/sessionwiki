@@ -1,5 +1,6 @@
 use super::{
-    dedup_paths, ok_or_flag, redacted_truncate, title_from_messages, Adapter, Discovered, Store,
+    bounded_redacted_output, dedup_paths, ok_or_flag, redacted_truncate, title_from_messages,
+    Adapter, Discovered, Store,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
@@ -10,8 +11,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// OpenCode (sst/opencode) keeps its data under `$XDG_DATA_HOME/opencode`
 /// (default `~/.local/share/opencode`, the same on macOS - it uses
@@ -476,15 +475,6 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 fn sorted_json(dir: &Path) -> Vec<PathBuf> {

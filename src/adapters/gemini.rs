@@ -1,4 +1,6 @@
-use super::{ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered};
+use super::{
+    bounded_redacted_output, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered,
+};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::{Context, Result};
@@ -22,8 +24,6 @@ pub(crate) fn project_root(chat: &Path) -> Option<String> {
     let root = root.trim();
     Path::new(root).is_absolute().then(|| root.to_string())
 }
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 impl Adapter for Gemini {
     fn name(&self) -> &'static str {
@@ -312,13 +312,4 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }

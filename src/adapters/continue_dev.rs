@@ -1,4 +1,7 @@
-use super::{dedup_paths, ok_or_flag, redacted_truncate, title_from_messages, Adapter, Discovered};
+use super::{
+    bounded_redacted_output, dedup_paths, ok_or_flag, redacted_truncate, title_from_messages,
+    Adapter, Discovered,
+};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::{Context, Result};
@@ -6,8 +9,6 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// Continue (github continuedev/continue) stores one session per file at
 /// `~/.continue/sessions/<sessionId>.json`, plus a `sessions.json` index. The
@@ -356,15 +357,6 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 /// The session file carries no time; `sessions.json` records `dateCreated`

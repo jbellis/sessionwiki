@@ -1,4 +1,7 @@
-use super::{dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered};
+use super::{
+    bounded_redacted_output, dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter,
+    Discovered,
+};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::Result;
@@ -6,8 +9,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// Codex CLI stores one JSONL rollout per session under
 /// `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`.
@@ -389,15 +390,6 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 /// Codex wraps instructions and environment dumps in pseudo-XML tags and

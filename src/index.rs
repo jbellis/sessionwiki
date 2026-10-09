@@ -86,7 +86,7 @@ pub const SCHEMA_VERSION: i64 = 9; // 9: compact tool lines + optional full outp
 
 const DEFAULT_FTS_TOKENIZER: &str = "trigram";
 const FTS_TOKENIZER_META_KEY: &str = "fts_tokenizer";
-const DEFAULT_TOOL_OUTPUT_MODE: ToolOutputMode = ToolOutputMode::Full;
+const DEFAULT_TOOL_OUTPUT_MODE: ToolOutputMode = ToolOutputMode::Summary;
 const TOOL_OUTPUT_MODE_META_KEY: &str = "tool_output_mode";
 
 /// Whether full tool results are retained in the index and archive.
@@ -94,7 +94,8 @@ const TOOL_OUTPUT_MODE_META_KEY: &str = "tool_output_mode";
 pub enum ToolOutputMode {
     /// Retain bounded, redacted tool output separately from searchable text.
     Full,
-    /// Keep only compact tool summary lines in the index and archive.
+    /// Keep compact tool summary lines in the index and archive. Failed calls
+    /// include the first output line in their summary.
     Summary,
 }
 
@@ -343,7 +344,7 @@ pub fn set_tokenizer_spec(conn: &Connection, spec: &str) -> Result<bool> {
 }
 
 /// Read whether full tool results are retained. Indexes without an explicit
-/// choice use `full`, preserving the archive behavior from earlier versions.
+/// choice use `summary`, keeping compact tool lines in the archive.
 pub fn tool_output_mode(conn: &Connection) -> Result<ToolOutputMode> {
     let value = conn
         .query_row(
@@ -4002,6 +4003,7 @@ mod tool_output_tests {
     fn full_mode_archives_and_rehydrates_output_without_adding_it_to_fts() {
         let mut conn = Connection::open_in_memory().unwrap();
         create_cache_schema(&conn).unwrap();
+        assert!(set_tool_output_mode(&conn, ToolOutputMode::Full).unwrap());
         assert_eq!(tool_output_mode(&conn).unwrap(), ToolOutputMode::Full);
         insert_tool_session(&mut conn, "full-session", "/gone/full-session.jsonl");
 
@@ -4045,9 +4047,17 @@ mod tool_output_tests {
     }
 
     #[test]
+    fn fresh_index_defaults_to_summary_mode() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_cache_schema(&conn).unwrap();
+        assert_eq!(tool_output_mode(&conn).unwrap(), ToolOutputMode::Summary);
+    }
+
+    #[test]
     fn summary_mode_preserves_archived_output_and_full_mode_marks_live_rows_stale() {
         let mut conn = Connection::open_in_memory().unwrap();
         create_cache_schema(&conn).unwrap();
+        assert!(set_tool_output_mode(&conn, ToolOutputMode::Full).unwrap());
         insert_tool_session(&mut conn, "archived", "/gone/archived.jsonl");
         insert_tool_session(&mut conn, "live", "/live/live.jsonl");
         archive_session(&conn, "/gone/archived.jsonl", "archived").unwrap();

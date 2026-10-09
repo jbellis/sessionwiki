@@ -211,6 +211,7 @@ fn archived_tool_output_is_available_to_show_full_and_brief_tools() {
         }
         result.unwrap()
     };
+    index::set_tool_output_mode(&conn, index::ToolOutputMode::Full).unwrap();
     index::sync_with(
         &mut conn,
         &[Box::new(ToolOutputAdapter {

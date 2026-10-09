@@ -1,12 +1,13 @@
-use super::{dedup_paths, redacted_truncate, title_from_messages, Adapter, Discovered};
+use super::{
+    bounded_redacted_output, dedup_paths, redacted_truncate, title_from_messages, Adapter,
+    Discovered,
+};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-
-const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
 /// The Cline family of VS Code agents - Cline, Roo Code, and Kilo Code (a Roo
 /// fork) - share one on-disk layout, so one parser covers all three. Each is a
@@ -420,15 +421,6 @@ fn redact_json_strings(value: &mut Value) {
         Value::Object(values) => values.values_mut().for_each(redact_json_strings),
         _ => {}
     }
-}
-
-fn bounded_redacted_output(text: &str) -> String {
-    let redacted = crate::redact::redact(text);
-    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
-    while !redacted.is_char_boundary(end) {
-        end -= 1;
-    }
-    redacted[..end].to_owned()
 }
 
 fn xml_result_echoes(text: &str) -> Vec<String> {

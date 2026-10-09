@@ -275,7 +275,7 @@ mod tests {
             .find(|c| c.name == "tool output storage")
             .unwrap();
         assert_eq!(tool_output.status, Status::Ok);
-        assert_eq!(tool_output.detail, "full");
+        assert_eq!(tool_output.detail, "summary");
         let tables = checks.iter().find(|c| c.name == "index tables").unwrap();
         assert_eq!(tables.status, Status::Ok, "all core tables readable");
         let sessions = checks

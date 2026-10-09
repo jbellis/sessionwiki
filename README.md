@@ -153,7 +153,7 @@ GB). After that, updates are incremental and take seconds.
 | `list` | Recent sessions across all tools in one timeline. `--tool codex`, `--project api`, `--tag spike`, `-n 50`, `--all` (include subagent transcripts). |
 | `search <query>` | Search every message across tools. Terms are ANDed within one message; double quotes mark a phrase. Use `--role user,assistant` to search only the conversation, excluding tool output. Matching depends on the configured tokenizer (see `tokenizer`). |
 | `tokenizer [SPEC]` | Show the current FTS5 tokenizer, or set one and rebuild only the search index. |
-| `tool-output [MODE]` | Show or change whether full tool results are retained in this index. `full` is the default; `summary` removes stored results for live sessions. |
+| `tool-output [MODE]` | Show or change whether full tool results are retained in this index. `summary` is the default; use `sessionwiki tool-output full` to retain them. |
 | `recall <query>` | Search, list the matches, and brief the top one in a single command &mdash; the fastest way back into a past session. `--tool`, `--project`, `-n`, `--json` (for agents). |
 | `show <id>` | One session as a readable transcript with compact tool summaries. `--full` appends bounded tool output from the live file or index, `--json` emits the parsed session, `--outline` prints a digest: every question you asked plus how it ended. |
 | `summarize [id]` | 1&ndash;2 sentence synopses via **your own LLM CLI** (`claude -p` default; `--cmd` / `SESSIONWIKI_SUMMARIZER` to change), cached in the index and shown in `show`, `--outline`, and the web sidebar. Without an id, batches the `--recent N` newest. |
@@ -177,16 +177,20 @@ existing indexed messages without reparsing session files. Quote specs that
 contain spaces, for example `sessionwiki tokenizer 'porter unicode61'` or
 `sessionwiki tokenizer 'unicode61 remove_diacritics 2'`.
 
-Full tool results are retained separately from searchable transcript text by
-default, so `show --full` and `brief --tools` can still read them after a tool
-deletes the source session. The `full` or `summary` choice is stored per index;
-`sessionwiki tool-output summary` clears full results for live sessions, while
-already archived sessions keep their existing output. SQLite space from the
-removed live data can be reclaimed with `VACUUM`. Switching back to `full`
-marks live sessions for re-parsing on the next sync; archived sessions keep the
-data they already have. This per-index setting lets embedders that share the
-index avoid storing full output. Embedders can read or set it with
-`index::tool_output_mode` and `index::set_tool_output_mode`.
+With the default `summary` mode, newly archived sessions keep each tool call's
+compact summary line; a failed call's line also includes the first line of its
+output. This is less than the previous behavior, which kept up to 500
+characters of tool output.
+Run `sessionwiki tool-output full` to retain capped, redacted output (up to 8
+KB per result) separately from searchable transcript text, so `show --full`
+and `brief --tools` can still read it after a tool deletes the source session.
+The `full` or `summary` choice is stored per index. Switching to `summary`
+clears full results for live sessions, while archived sessions keep the output
+they already contain. SQLite space from removed live data can be reclaimed
+with `VACUUM`. Switching back to `full` marks live sessions for re-parsing on
+the next sync. This per-index setting lets embedders that share the index avoid
+storing full output. Embedders can read or set it with `index::tool_output_mode`
+and `index::set_tool_output_mode`.
 
 ### Session engineering
 
@@ -257,16 +261,18 @@ already exist, and the ones the tool deleted while you weren't looking.
 
 **It also reclaims disk.** The index keeps a distilled copy of each session
 (the conversation and its file links, with tool calls represented by compact
-summary lines). In the default `full` mode it also keeps bounded tool results
-in a separate, non-searchable column; `sessionwiki tool-output summary` clears
-those results for live sessions when storage minimization matters. Previously
-archived sessions retain the results they already contain. The index is far
-smaller than the raw stores &mdash; roughly 7&times; in summary mode on the machine
-above (47 GB &rarr; ~7 GB). Delete the old raw sessions to free the space and
-`search`, `trace`, `brief`, and reading still work from the index. The tradeoff:
-an archived session is the distilled transcript, not the byte-exact original &mdash;
+summary lines). In the default `summary` mode it keeps no full tool results;
+failed calls include their first output line in the compact summary. Use
+`sessionwiki tool-output full` to retain up to 8 KB of redacted tool output per
+result in a separate, non-searchable column. The index is far
+smaller than the raw stores &mdash; roughly 7&times; on the machine above (47 GB
+&rarr; ~7 GB). Delete the old raw sessions to free the space and `search`,
+`trace`, `brief`, and reading still work from the index. The tradeoff: an
+archived session is the distilled transcript, not the byte-exact original &mdash;
 which is exactly the part you want when you are hunting for the conversation that
-solved something.
+solved something. In the default `summary` mode that transcript keeps less tool
+output than earlier versions, which kept up to 500 characters per result; choose
+`full` when the archive needs capped full output.
 
 ## Pick up where you left off
 

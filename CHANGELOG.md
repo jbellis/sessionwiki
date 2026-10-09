@@ -15,12 +15,14 @@ semantic versioning once it reaches 1.0.
   Continue, Gajae, OpenCode) emits structured calls and results, and one shared
   renderer formats them. The line is what `show`, `brief`, the web UI, MCP and
   search see; `brief` now includes tool lines by default, and `--tools`
-  (`brief`) or `--full` (`show`) append bounded output. Full output is retained
-  separately from FTS by default, so archive mode preserves it after the source
-  file is deleted. The per-index `sessionwiki tool-output` setting lets
-  embedders opt out of storing full output: `summary` clears it for live
-  sessions, while previously archived sessions keep their existing output.
-  Switching back to `full` marks live sessions for re-parsing.
+  (`brief`) or `--full` (`show`) append bounded output. The default `summary`
+  mode keeps only the compact line in new archives, plus the first output line
+  for failed calls. This is less than the previous behavior, which kept up to
+  500 characters of tool output. Run `sessionwiki tool-output full` to retain up
+  to 8 KB of redacted output per result in archive mode. The per-index setting
+  lets embedders choose; switching to `summary` clears full output from live
+  sessions, while already archived sessions keep what they have. Switching
+  back to `full` marks live sessions for re-parsing.
   Tool output is no longer indexed, so a string that appeared only mid-output
   no longer matches a search. Schema v9 rebuilds each existing index once on
   first use; the first run after upgrading re-parses every session, which can

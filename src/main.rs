@@ -74,7 +74,7 @@ enum Command {
     },
     /// Show or change whether full tool output is retained in the index
     ToolOutput {
-        /// Retention mode: `full` (default) or `summary`
+        /// Retention mode: `summary` (default) or `full`
         mode: Option<String>,
     },
     /// Recall past work in one step: search, then brief the top match

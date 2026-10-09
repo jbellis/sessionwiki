@@ -258,6 +258,19 @@ pub(crate) fn redacted_truncate(text: &str, max: usize) -> String {
     crate::util::truncate(&crate::redact::redact(text), max)
 }
 
+const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
+
+/// Redact a complete tool result, then cap it without splitting a UTF-8 code
+/// point. Redacting before truncation keeps credential detection intact.
+pub(crate) fn bounded_redacted_output(text: &str) -> String {
+    let redacted = crate::redact::redact(text);
+    let mut end = redacted.len().min(MAX_TOOL_OUTPUT_BYTES);
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    redacted[..end].to_owned()
+}
+
 /// First-line title variant for adapters whose existing format uses a hard
 /// character cap without an ellipsis. Redaction happens before line selection
 /// so a multi-line credential is considered as one logical value.
