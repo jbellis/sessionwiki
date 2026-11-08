@@ -6,6 +6,11 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.22] - 2026-11-08
+
+Published as `brokk-sessionwiki`: SessionWiki 0.34.21 with two fixes that are
+not yet in an upstream release.
+
 ### Fixed
 
 - A sync no longer rewrites every message of a session that changed. It keeps
