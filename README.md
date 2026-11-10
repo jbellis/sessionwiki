@@ -5,9 +5,8 @@
   <img src="docs/banner.png" alt="sessionwiki — every AI coding session you've ever had: searchable, linkable, resumable, across 11 AI coding tools. 100% local.">
 </picture>
 
-<a href="https://github.com/youdie006/sessionwiki/actions/workflows/ci.yml"><img src="https://github.com/youdie006/sessionwiki/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-<a href="https://crates.io/crates/sessionwiki"><img src="https://img.shields.io/crates/v/sessionwiki?logo=rust&color=3b5bd6" alt="crates.io"></a>
-<a href="https://github.com/youdie006/sessionwiki/releases/latest"><img src="https://img.shields.io/github/v/release/youdie006/sessionwiki?color=3b5bd6&label=release" alt="Latest release"></a>
+<a href="https://github.com/jbellis/sessionwiki/actions/workflows/ci.yml"><img src="https://github.com/jbellis/sessionwiki/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+<a href="https://crates.io/crates/brokk-sessionwiki"><img src="https://img.shields.io/crates/v/brokk-sessionwiki?logo=rust&color=3b5bd6" alt="crates.io"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 
 <b>English</b> &middot; <a href="README.ko.md">한국어</a>
@@ -53,50 +52,26 @@ And a web UI for reading and browsing, not just grepping &mdash; live search, re
 
 ## Install
 
-**npm** (macOS / Linux / Windows; you likely have Node already if you use
-Claude Code or Codex):
+This is the `brokk-sessionwiki` fork, version **0.34.24**, with native Kimi,
+Grok, Muse and DeepSeek readers. Install this fork with Cargo (stable Rust):
 
 ```console
-npm i -g @youdie006/sessionwiki
+cargo install --locked brokk-sessionwiki@0.34.24
 ```
 
-On macOS this is the install to prefer: npm upgrades the binary in place, and
-the binary is signed with one stable identity, so when macOS asks once to let
-sessionwiki read Documents or Desktop, that answer still holds after upgrades.
-Homebrew installs each version under a new path, so macOS asks again.
+The executable remains `sessionwiki`. If Cargo reports that an upstream
+installation already owns that executable, uninstall the `sessionwiki` Cargo
+package first, then run the command above.
 
-**Homebrew** (macOS / Linux):
+To embed this release as a Rust library:
 
-```console
-brew install youdie006/tap/sessionwiki
+```toml
+sessionwiki = { package = "brokk-sessionwiki", version = "0.34.24" }
 ```
 
-**Prebuilt binary** (no toolchain needed). macOS / Linux / WSL:
-
-```console
-curl -sSL https://raw.githubusercontent.com/youdie006/sessionwiki/main/scripts/install.sh | sh
-```
-
-**Windows** (native PowerShell):
-
-```powershell
-irm https://raw.githubusercontent.com/youdie006/sessionwiki/main/scripts/install.ps1 | iex
-```
-
-Each script downloads the right archive for your platform from the
-[latest release](https://github.com/youdie006/sessionwiki/releases/latest),
-verifies its checksum, and installs the binary (`~/.local/bin`, or
-`%LOCALAPPDATA%\Programs\sessionwiki` on Windows). **WSL is Linux** &mdash; use
-the shell one-liner above; it installs the Linux binary and reads the session
-stores in your WSL home.
-
-**With Rust** (stable):
-
-```console
-cargo install sessionwiki
-```
-
-Either way it is a single binary with no runtime dependencies.
+This fork is distributed through crates.io. The npm, Homebrew and prebuilt
+binary installers in the [upstream installation guide](https://github.com/youdie006/sessionwiki#install)
+install upstream SessionWiki and follow its release schedule.
 
 ### Claude Code plugin (long-term memory)
 
@@ -105,7 +80,7 @@ recall your past sessions automatically. Install the `sessionwiki` CLI first
 (above), then add the plugin from this repo:
 
 ```console
-/plugin marketplace add youdie006/sessionwiki
+/plugin marketplace add jbellis/sessionwiki
 /plugin install sessionwiki@sessionwiki-marketplace
 ```
 
