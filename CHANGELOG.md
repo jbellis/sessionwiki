@@ -6,6 +6,27 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.25] - 2026-11-10
+
+### Fixed
+
+- Grok and Muse readers provide `keep_configured_paths()` for embedders whose
+  existing session keys retain symlinked profile-home spelling. Defaults keep
+  canonical keys compatible with 0.34.24. Reading an existing key preserves
+  its spelling under either policy.
+- Standalone and embedded writers sharing an index reuse the first indexed
+  key and ID for the same physical Grok or Muse session. Notes and tags stay
+  attached, unchanged sessions do not churn, and deletion reconciliation
+  protects other homes and concurrent inserts or updates. Filesystem scans
+  and parsing leave the database available to other writers; root aliases
+  coordinate in short transactions. Filesystem shared stores opt in through
+  the optional `Adapter::path_key_depth()` hook.
+
+## [0.34.24] - 2026-11-10
+
+Fork release of SessionWiki 0.34.23 with the native harness readers below.
+The Rust library and executable retain the name `sessionwiki`.
+
 ### Added
 
 - Native readers for Kimi Code, Grok Build, Muse Code, and DeepSeek Harness,
@@ -19,16 +40,6 @@ semantic versioning once it reaches 1.0.
 
 ### Fixed
 
-- Grok and Muse readers expose `keep_configured_paths()` for embedders whose
-  existing keys retain symlinked profile-home spelling. The default keeps
-  canonical keys compatible with earlier SessionWiki indexes. Both policies
-  preserve stored IDs and reconcile deleted sessions in their own namespace.
-- Shared Grok and Muse indexes reuse the first indexed key and ID when the CLI
-  and an embedder read the same store through different path aliases. Notes
-  and tags remain attached, unchanged sessions do not churn, and reconciliation
-  protects other homes and concurrent updates. Filesystem scans and parsing
-  leave the database available to other writers; root aliases coordinate in
-  short transactions. Adapters opt in with `path_key_depth()`.
 - Read all concatenated Zstandard frames in compressed session logs and accept
   the `.zstd` extension used by DeepSeek Harness. Previously only the first
   frame was decoded, which can contain just the session metadata.
