@@ -6,6 +6,11 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.24] - 2026-11-10
+
+Fork release of SessionWiki 0.34.23 with the native harness readers below.
+The Rust library and executable retain the name `sessionwiki`.
+
 ### Added
 
 - Native readers for Kimi Code, Grok Build, Muse Code, and DeepSeek Harness,
