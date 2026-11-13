@@ -335,7 +335,7 @@ one feature that touches an LLM is `summarize`, and it does so by running a CLI
 | Claude Code | `~/.claude/projects/**/*.jsonl` (incl. nested subagent transcripts) | supported |
 | Codex CLI | `~/.codex/sessions/**/rollout-*.jsonl[.zst]`, `~/.codex/archived_sessions/`, `~/.codex/thread_history_*.sqlite` | supported |
 | Gemini CLI | `~/.gemini/tmp/*/chats/*.json[l]` | supported &mdash; Google retired Gemini CLI for personal accounts on 2026-06-18 in favour of Antigravity CLI; the chats it left on disk are still indexed |
-| Antigravity CLI and IDE | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`, `~/.gemini/antigravity/brain/` | in review ([#83](https://github.com/youdie006/sessionwiki/pull/83)) |
+| Antigravity CLI and IDE | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`, `~/.gemini/antigravity/brain/` | supported (native JSONL transcripts for both stores) |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite v1/v2; also the legacy `storage/**` JSON) | supported |
 | Kimi Code | `$KIMI_CODE_HOME/sessions/` (default `~/.kimi-code`), listed by `session_index.jsonl` | supported |
 | Grok Build | `$GROK_HOME/sessions/<encoded-cwd>/<id>/chat_history.jsonl` (default `~/.grok`) | supported |

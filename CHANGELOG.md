@@ -8,6 +8,12 @@ semantic versioning once it reaches 1.0.
 
 ### Added
 
+- Read Antigravity IDE and agy CLI native transcripts, including explicit
+  Gemini configuration homes. Stable conversation keys deduplicate compact
+  and full logs; full-stream edit evidence survives conversation windowing.
+  Native summary metadata supplies titles, workspaces and parent relationships.
+
+
 - Read OpenCode v2 SQLite sessions alongside v1 sessions in mixed databases,
   retaining session keys and IDs. Separate schema readers share one inventory
   per database; failed SQL scans skip deletion reconciliation and failed v2
