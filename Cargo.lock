@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-sessionwiki"
-version = "0.34.25"
+version = "0.34.26"
 dependencies = [
  "anyhow",
  "chrono",

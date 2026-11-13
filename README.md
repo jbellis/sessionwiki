@@ -52,11 +52,11 @@ And a web UI for reading and browsing, not just grepping &mdash; live search, re
 
 ## Install
 
-This is the `brokk-sessionwiki` fork, version **0.34.25**, with native Kimi,
-Grok, Muse and DeepSeek readers. Install this fork with Cargo (stable Rust):
+This is the `brokk-sessionwiki` fork, version **0.34.26**, with native Kimi,
+Grok, Muse, DeepSeek, Antigravity and OpenCode v2 readers. Install this fork with Cargo (stable Rust):
 
 ```console
-cargo install --locked brokk-sessionwiki@0.34.25
+cargo install --locked brokk-sessionwiki@0.34.26
 ```
 
 The executable remains `sessionwiki`. If Cargo reports that an upstream
@@ -66,7 +66,7 @@ package first, then run the command above.
 To embed this release as a Rust library:
 
 ```toml
-sessionwiki = { package = "brokk-sessionwiki", version = "0.34.25" }
+sessionwiki = { package = "brokk-sessionwiki", version = "0.34.26" }
 ```
 
 This fork is distributed through crates.io. The npm, Homebrew and prebuilt

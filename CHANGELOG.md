@@ -6,6 +6,8 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.26] - 2026-11-13
+
 ### Added
 
 - Read Antigravity IDE and agy CLI native transcripts, including explicit
