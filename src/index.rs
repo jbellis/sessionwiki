@@ -1440,10 +1440,27 @@ pub fn sync_bounded(
 /// its own sessions by passing its own [`Adapter`] alongside `adapters::all()`.
 /// Readers without that adapter use the indexed transcript; call this again
 /// to make later changes to those sessions visible to the standalone binary.
+pub struct SyncProgress<'a> {
+    pub tool: &'a str,
+    pub adapter: usize,
+    pub adapters: usize,
+    pub done: usize,
+    pub total: Option<usize>,
+}
+
 pub fn sync_with(
     conn: &mut Connection,
     adapters: &[Box<dyn Adapter>],
     since: Option<i64>,
+) -> Result<()> {
+    sync_with_progress(conn, adapters, since, &mut |_| {})
+}
+
+pub fn sync_with_progress(
+    conn: &mut Connection,
+    adapters: &[Box<dyn Adapter>],
+    since: Option<i64>,
+    on_progress: &mut dyn FnMut(&SyncProgress<'_>),
 ) -> Result<()> {
     // Per-session progress redraws one line with `\r`, which only means
     // anything on a terminal. Redirected into a log it becomes a single line
@@ -1472,11 +1489,18 @@ pub fn sync_with(
     }
 
     let mut archived_total = 0usize;
-    for adapter in adapters {
+    for (adapter_index, adapter) in adapters.iter().enumerate() {
         // `store_present` tells "the tool pruned some sessions" (root exists,
         // those gone) apart from "the whole store vanished" (uninstall,
         // unmounted) - we must not mass-archive on the latter.
         let tool = adapter.name();
+        on_progress(&SyncProgress {
+            tool,
+            adapter: adapter_index + 1,
+            adapters: adapters.len(),
+            done: 0,
+            total: None,
+        });
         let store_present = adapter.root().is_some_and(|r| r.exists());
 
         // Shared store (e.g. OpenCode's SQLite db): enumerate sessions by key +
@@ -1501,6 +1525,13 @@ pub fn sync_with(
                 seen.push(key.clone());
             }
             restore_unchanged(conn, &restore)?;
+            on_progress(&SyncProgress {
+                tool,
+                adapter: adapter_index + 1,
+                adapters: adapters.len(),
+                done: 0,
+                total: Some(pending.len()),
+            });
             // Reconcile deletions only when the whole store was read this run.
             // If a backing db was present but unreadable (locked, half-written),
             // `seen` is partial - pruning off it would archive the whole corpus
@@ -1543,11 +1574,25 @@ pub fn sync_with(
                         Err(e) => {
                             failed += 1;
                             eprintln!("\r[{tool}] failed to parse {key}: {e:#}");
+                            on_progress(&SyncProgress {
+                                tool,
+                                adapter: adapter_index + 1,
+                                adapters: adapters.len(),
+                                done: i + 1,
+                                total: Some(total),
+                            });
                             continue;
                         }
                     };
                     let token = token_of.get(key.as_str()).copied().unwrap_or(0);
                     index_one(&tx, &session, key, token, 0, output_mode)?;
+                    on_progress(&SyncProgress {
+                        tool,
+                        adapter: adapter_index + 1,
+                        adapters: adapters.len(),
+                        done: i + 1,
+                        total: Some(total),
+                    });
                 }
                 tx.commit()?;
                 report_indexed(tool, total, failed);
@@ -1596,6 +1641,13 @@ pub fn sync_with(
             seen.push(key);
         }
         restore_unchanged(conn, &restore)?;
+        on_progress(&SyncProgress {
+            tool,
+            adapter: adapter_index + 1,
+            adapters: adapters.len(),
+            done: 0,
+            total: Some(pending.len()),
+        });
 
         // Same guard the shared-store path has: a partial walk (an unreadable
         // directory) means `seen` is incomplete - reconciling deletions off it
@@ -1636,11 +1688,25 @@ pub fn sync_with(
                 Err(e) => {
                     failed += 1;
                     eprintln!("\r[{tool}] failed to parse {}: {e:#}", path.display());
+                    on_progress(&SyncProgress {
+                        tool,
+                        adapter: adapter_index + 1,
+                        adapters: adapters.len(),
+                        done,
+                        total: Some(total),
+                    });
                     continue;
                 }
             };
             let key = path.to_string_lossy();
             index_one(&tx, &session, &key, mtime, size, output_mode)?;
+            on_progress(&SyncProgress {
+                tool,
+                adapter: adapter_index + 1,
+                adapters: adapters.len(),
+                done,
+                total: Some(total),
+            });
         }
         tx.commit()?;
         report_indexed(tool, total, failed);
@@ -4319,6 +4385,40 @@ mod embedder_hook_tests {
         assert_eq!(rows[0].title, "a restored session");
         assert_eq!(rows[0].msg_count, 1);
         assert!(!rows[0].archived, "a listed session stays live");
+    }
+
+    #[test]
+    fn sync_with_progress_reports_adapters_in_order_through_completion() {
+        let mut c = Connection::open_in_memory().unwrap();
+        create_cache_schema(&c).unwrap();
+
+        let adapters: Vec<Box<dyn Adapter>> = vec![
+            Box::new(FakeStore {
+                keys: vec![("/data/one/sess-a".to_string(), 42)],
+                scope: Some("/data/one/".to_string()),
+            }),
+            Box::new(FakeStore {
+                keys: vec![("/data/two/sess-b".to_string(), 43)],
+                scope: Some("/data/two/".to_string()),
+            }),
+        ];
+        let mut reports = Vec::new();
+        sync_with_progress(&mut c, &adapters, None, &mut |p| {
+            reports.push((p.adapter, p.adapters, p.done, p.total));
+        })
+        .unwrap();
+
+        assert_eq!(
+            reports.iter().map(|r| r.0).collect::<Vec<_>>(),
+            [1, 1, 1, 2, 2, 2]
+        );
+        assert!(reports.iter().all(|r| r.1 == 2));
+        for adapter in 1..=2 {
+            assert_eq!(
+                reports.iter().rfind(|r| r.0 == adapter),
+                Some(&(adapter, 2, 1, Some(1)))
+            );
+        }
     }
 
     /// A row whose tool only an embedder's adapter knows still shows that

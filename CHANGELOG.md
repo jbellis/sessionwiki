@@ -6,6 +6,13 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.22] - 2026-11-18
+
+### Added
+
+- Expose per-adapter indexing progress through `sync_with_progress`, while
+  keeping `sync_with` output unchanged.
+
 ## [0.34.21] - 2026-10-28
 
 ### Fixed
