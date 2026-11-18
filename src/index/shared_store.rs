@@ -22,6 +22,7 @@ pub(super) fn sync(
     adapter: &dyn Adapter,
     known: &mut HashMap<String, (i64, i64, bool)>,
     options: Options,
+    on_progress: &mut dyn FnMut(usize, Option<usize>),
 ) -> Result<Option<usize>> {
     // Snapshot before discovery, without a writer lock. This also resolves
     // filesystem roots once per store, rather than once per session.
@@ -30,9 +31,9 @@ pub(super) fn sync(
         return Ok(None);
     };
     if let Some(aliases) = aliases {
-        sync_aliased(conn, adapter, &store, aliases, known, options).map(Some)
+        sync_aliased(conn, adapter, &store, aliases, known, options, on_progress).map(Some)
     } else {
-        sync_store(conn, adapter, &store, known, options).map(Some)
+        sync_store(conn, adapter, &store, known, options, on_progress).map(Some)
     }
 }
 
@@ -63,6 +64,7 @@ fn sync_aliased(
     mut aliases: path_keys::PathKeys,
     known: &mut HashMap<String, (i64, i64, bool)>,
     options: Options,
+    on_progress: &mut dyn FnMut(usize, Option<usize>),
 ) -> Result<usize> {
     let tool = adapter.name();
     let store_present = adapter.root().is_some_and(|root| root.exists());
@@ -79,6 +81,7 @@ fn sync_aliased(
         })
         .collect();
     let total = sources.iter().filter(|(_, _, parse)| *parse).count();
+    on_progress(0, Some(total));
     let mut attempted = 0;
     let mut failed = 0;
     for (key, token, parse) in sources {
@@ -93,6 +96,7 @@ fn sync_aliased(
                 Err(error) => {
                     failed += 1;
                     eprintln!("\r[{tool}] failed to parse {key}: {error:#}");
+                    on_progress(attempted, Some(total));
                     continue;
                 }
             }
@@ -126,6 +130,9 @@ fn sync_aliased(
             known.insert(indexed_key.clone(), (token, 0, false));
         }
         tx.commit()?;
+        if parse {
+            on_progress(attempted, Some(total));
+        }
     }
     if total > 0 {
         report_indexed(tool, total, failed);
@@ -148,6 +155,7 @@ fn sync_store(
     store: &Store,
     known: &mut HashMap<String, (i64, i64, bool)>,
     options: Options,
+    on_progress: &mut dyn FnMut(usize, Option<usize>),
 ) -> Result<usize> {
     let Options {
         since,
@@ -169,6 +177,7 @@ fn sync_store(
         seen.push(key.clone());
     }
     restore_unchanged(conn, &restore)?;
+    on_progress(0, Some(pending.len()));
     let archived = if store.had_error {
         warn_incomplete(tool);
         0
@@ -195,11 +204,13 @@ fn sync_store(
                 Err(error) => {
                     failed += 1;
                     eprintln!("\r[{tool}] failed to parse {key}: {error:#}");
+                    on_progress(i + 1, Some(total));
                     continue;
                 }
             };
             index_one(&tx, &session, key, *token, 0, output_mode)?;
             known.insert((*key).clone(), (*token, 0, false));
+            on_progress(i + 1, Some(total));
         }
         tx.commit()?;
         report_indexed(tool, total, failed);
