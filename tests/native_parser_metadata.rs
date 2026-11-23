@@ -127,6 +127,46 @@ fn claude_uses_literal_primary_cwd_and_completed_edits_per_log() {
     );
 }
 
+#[test]
+fn claude_multiedit_requires_a_success_result_in_its_own_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("session.jsonl");
+    let child = tmp.path().join("session/subagents/nested/child.jsonl");
+    let call = |id, path| {
+        json!({"type":"assistant","message":{"content":[{
+            "type":"tool_use","name":"MultiEdit","id":id,"input":{"file_path":path,"edits":[]}
+        }]}})
+    };
+    let result = |id, is_error| {
+        json!({"type":"user","message":{"content":[{
+            "type":"tool_result","tool_use_id":id,"is_error":is_error
+        }]}})
+    };
+    write_lines(
+        &main,
+        &[
+            call("ok", "main "),
+            result("ok", false),
+            call("unpaired", "no-result"),
+            call("error", "failed"),
+            result("error", true),
+        ],
+    );
+    write_lines(
+        &child,
+        &[
+            result("unpaired", false),
+            call("ok", "child "),
+            result("ok", false),
+        ],
+    );
+    let adapter = ClaudeCode::in_home(tmp.path());
+    assert_eq!(
+        adapter.parse(&main).unwrap().operational_edited_paths,
+        ["main ", "child "]
+    );
+}
+
 fn completed(item: Value) -> Value {
     json!({"type":"event_msg","payload":{"type":"item_completed","item":item}})
 }

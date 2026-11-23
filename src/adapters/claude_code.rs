@@ -390,15 +390,10 @@ impl NativeEvidence {
                 let ts = record["timestamp"].as_str().and_then(parse_ts);
                 for block in blocks.filter(|b| b["type"] == "tool_use") {
                     let name = block["name"].as_str().unwrap_or_default();
-                    if matches!(
-                        name,
-                        "Edit" | "Write" | "NotebookEdit" | "str_replace_based_edit_tool"
-                    ) {
-                        if let (Some(id), Some(raw)) =
-                            (call_id(block), edited_path(name, block.get("input")))
-                        {
-                            self.candidates.push((Some(id), raw));
-                        }
+                    if let (Some(id), Some(raw)) =
+                        (call_id(block), edited_path(name, block.get("input")))
+                    {
+                        self.candidates.push((Some(id), raw));
                     }
                     if windowed {
                         if let Some(edit) = edit_event(name, block.get("input"), ts) {

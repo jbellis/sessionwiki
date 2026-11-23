@@ -6,13 +6,16 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
-## 0.34.28 - 2026-11-22
+## [0.34.28] - 2026-11-22
 
 ### Added
 
 - Expose literal native session IDs, working directories, and operational edit
   paths for supported harnesses, plus compaction-prefix and Grok reasoning
   markers in parsed sessions. The index schema stays at version 9.
+- Rust callers using struct literals must initialize the new public fields
+  `raw_cwd`, `operational_edited_paths`, and `compacted_prefix` on
+  `model::Session` and `is_thought` on `model::Message`.
 - Parse paginated Codex dialogue and completed file changes, reconciling
   dialogue mirrors and preserving edit evidence in large rollouts.
 

@@ -36,10 +36,21 @@ pub fn session_lines_keeping(
     keep: impl Fn(&str) -> bool,
 ) -> Result<(Vec<String>, bool)> {
     let (cap, head, tail) = window_limits();
-    let middle = MIDDLE_KEPT_BYTES;
+    lines_keeping(path, cap, head, tail, middle_kept_bytes(), keep)
+}
+
+pub(crate) fn middle_kept_bytes() -> u64 {
     #[cfg(test)]
-    let middle = TEST_MIDDLE_BYTES.with(|w| w.get()).unwrap_or(middle);
-    lines_keeping(path, cap, head, tail, middle, keep)
+    if let Some(bytes) = TEST_MIDDLE_BYTES.with(|w| w.get()) {
+        return bytes;
+    }
+    MIDDLE_KEPT_BYTES
+}
+
+/// A raw head/tail window with source positions for merging streamed projections.
+pub(crate) fn numbered_session_lines(path: &Path) -> Result<(Vec<(usize, String)>, bool)> {
+    let (cap, head, tail) = window_limits();
+    numbered_lines_keeping(path, cap, head, tail, 0, |_| false)
 }
 
 fn lines_keeping(
@@ -50,25 +61,38 @@ fn lines_keeping(
     middle_bytes: u64,
     keep: impl Fn(&str) -> bool,
 ) -> Result<(Vec<String>, bool)> {
-    let mut all: Vec<String> = Vec::new();
+    let (lines, windowed) =
+        numbered_lines_keeping(path, cap, head_bytes, tail_bytes, middle_bytes, keep)?;
+    Ok((lines.into_iter().map(|(_, line)| line).collect(), windowed))
+}
+
+fn numbered_lines_keeping(
+    path: &Path,
+    cap: u64,
+    head_bytes: u64,
+    tail_bytes: u64,
+    middle_bytes: u64,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(Vec<(usize, String)>, bool)> {
+    let mut all = Vec::new();
     let mut total = 0u64;
     // A plain file's size is known before reading, so one over the cap is
     // windowed from its first line instead of being buffered up to the cap; a
     // compressed one is measured as it decodes.
     let mut windowed = !is_zstd(path) && std::fs::metadata(path).is_ok_and(|m| m.len() > cap);
-    let mut head: Vec<String> = Vec::new();
-    let mut middle: Vec<String> = Vec::new();
+    let mut head = Vec::new();
+    let mut middle = Vec::new();
     let mut middle_used = 0u64;
-    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut tail = std::collections::VecDeque::new();
     let mut tail_used = 0u64;
     let mut head_used = 0u64;
     // Once over the cap: a line goes to the head while it fits, then through
     // the tail, and a line leaving the tail survives only if it is kept.
-    let mut place = |line: String,
-                     head: &mut Vec<String>,
-                     middle: &mut Vec<String>,
-                     tail: &mut std::collections::VecDeque<String>| {
-        let n = line.len() as u64 + 1;
+    let mut place = |line: (usize, String),
+                     head: &mut Vec<_>,
+                     middle: &mut Vec<_>,
+                     tail: &mut std::collections::VecDeque<(usize, String)>| {
+        let n = line.1.len() as u64 + 1;
         if head_used + n <= head_bytes && middle.is_empty() && tail.is_empty() {
             head_used += n;
             head.push(line);
@@ -78,16 +102,18 @@ fn lines_keeping(
         tail.push_back(line);
         while tail_used > tail_bytes {
             let Some(old) = tail.pop_front() else { break };
-            let m = old.len() as u64 + 1;
+            let m = old.1.len() as u64 + 1;
             tail_used -= m;
-            if middle_used + m <= middle_bytes && keep(&old) {
+            if middle_used + m <= middle_bytes && keep(&old.1) {
                 middle_used += m;
                 middle.push(old);
             }
         }
     };
+    let mut ordinal = 0;
     for_each_line(path, |raw| {
-        let line = raw.trim_end_matches(['\n', '\r']).to_owned();
+        let line = (ordinal, raw.trim_end_matches(['\n', '\r']).to_owned());
+        ordinal += 1;
         total += raw.len() as u64;
         if !windowed {
             all.push(line);

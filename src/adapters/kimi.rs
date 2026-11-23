@@ -214,11 +214,8 @@ impl Adapter for KimiCode {
 
     fn modified_at(&self, key: &str) -> Option<DateTime<Utc>> {
         let path = Path::new(key);
-        let mut files = vec![path.join("state.json"), path.join("wire.jsonl")];
         let mut had_error = false;
-        for agent in directories(&path.join("agents"), &mut had_error) {
-            files.push(agent.join("wire.jsonl"));
-        }
+        let files = session_files(path, &mut had_error);
         // Global index appends must not make every historical session recent.
         // Semantic index changes still invalidate their session on full sync.
         files
@@ -289,14 +286,7 @@ impl Adapter for KimiCode {
             // The shared index is counted once above. Its mtime changes for
             // unrelated sessions; only this entry's semantic metadata belongs
             // in this session's token.
-            let mut files = Vec::new();
-            track_file(&path.join("state.json"), &mut files, &mut store.had_error);
-            track_file(&path.join("wire.jsonl"), &mut files, &mut store.had_error);
-            // Subagents are not separate sessions, but their files are real
-            // backing data and must count towards size and invalidation.
-            for agent in directories(&path.join("agents"), &mut store.had_error) {
-                track_file(&agent.join("wire.jsonl"), &mut files, &mut store.had_error);
-            }
+            let files = session_files(&path, &mut store.had_error);
             store.keys.push((
                 path.to_string_lossy().into_owned(),
                 change_token(&files, &path, cwd),
@@ -489,7 +479,12 @@ struct WireEvidence {
 impl WireEvidence {
     fn observe(&mut self, record: &Value) {
         match record["type"].as_str() {
-            Some("context.compaction" | "context.compacted" | "compaction") => {
+            Some(
+                "context.apply_compaction"
+                | "context.compaction"
+                | "context.compacted"
+                | "compaction",
+            ) => {
                 self.compacted_prefix |= !self.saw_prompt;
                 return;
             }
@@ -566,25 +561,18 @@ fn read_json_optional(path: &Path) -> Result<Value> {
     }
 }
 
-fn directories(path: &Path, had_error: &mut bool) -> Vec<PathBuf> {
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(_) => {
-            *had_error = true;
-            return Vec::new();
-        }
-    };
-    let mut paths = Vec::new();
-    for entry in entries {
-        match entry.and_then(|e| Ok((e.path(), e.file_type()?))) {
-            Ok((path, kind)) if kind.is_dir() => paths.push(path),
-            Ok(_) => {}
-            Err(_) => *had_error = true,
-        }
+fn session_files(path: &Path, had_error: &mut bool) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    track_file(&path.join("state.json"), &mut files, had_error);
+    let wire = path.join("wire.jsonl");
+    if !wire.symlink_metadata().is_ok_and(|meta| meta.is_symlink()) {
+        track_file(&wire, &mut files, had_error);
     }
-    paths.sort();
-    paths
+    match super::nested_jsonl(&path.join("agents")) {
+        Ok(wires) => files.extend(wires),
+        Err(_) => *had_error = true,
+    }
+    files
 }
 
 fn track_file(path: &Path, files: &mut Vec<PathBuf>, had_error: &mut bool) {
@@ -932,6 +920,72 @@ mod tests {
         fs::write(&wire, "changed").unwrap();
         assert_ne!(second, adapter.store().unwrap().keys[0].1);
         assert_eq!(dir_mtime, fs::metadata(&path).unwrap().modified().unwrap());
+    }
+
+    #[test]
+    fn native_apply_compaction_marks_only_the_missing_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = json!({"type":"context.apply_compaction","summary":"hidden"});
+        let user = prompt("recoverable prompt");
+        let path = fixture(
+            tmp.path(),
+            "compacted",
+            json!({}),
+            &[marker.clone(), user.clone()],
+        );
+        let adapter = KimiCode::in_home(tmp.path());
+        let session = adapter.parse(&path).unwrap();
+        assert!(session.compacted_prefix);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].text, "recoverable prompt");
+        fixture(tmp.path(), "compacted", json!({}), &[user, marker]);
+        assert!(!adapter.parse(&path).unwrap().compacted_prefix);
+    }
+
+    #[test]
+    fn nested_wire_appends_invalidate_the_session_and_symlinks_do_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = fixture(tmp.path(), "session-one", json!({}), &[prompt("main")]);
+        index(tmp.path(), &[entry(&path)]);
+        let nested = path.join("agents/child/nested/history.jsonl");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "").unwrap();
+
+        let adapter = KimiCode::in_home(tmp.path());
+        let first = adapter.store().unwrap();
+        assert!(first.files.contains(&nested));
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("outside.jsonl");
+            fs::write(&outside, "ignored").unwrap();
+            let link = path.join("agents/child/wire.jsonl");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            fs::write(&outside, "different content").unwrap();
+            let after = adapter.store().unwrap();
+            assert_eq!(after.keys, first.keys);
+            assert!(!after.files.contains(&link));
+            assert!(!after.had_error);
+        }
+        let call = event(
+            json!({"type":"tool.call","toolCallId":"edit","name":"Edit","args":{"path":"raw/path "}}),
+        );
+        let result =
+            event(json!({"type":"tool.result","toolCallId":"edit","result":{"isError":false}}));
+        fs::write(&nested, format!("{call}\n{result}\n")).unwrap();
+        let file = fs::File::open(&nested).unwrap();
+        let latest = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        file.set_times(fs::FileTimes::new().set_modified(latest))
+            .unwrap();
+        let after = adapter.store().unwrap();
+        assert_ne!(after.keys[0].1, first.keys[0].1);
+        assert_eq!(adapter.modified_at(&after.keys[0].0), Some(latest.into()));
+        assert_eq!(
+            adapter
+                .parse_key(&after.keys[0].0)
+                .unwrap()
+                .operational_edited_paths,
+            ["raw/path "]
+        );
     }
 
     #[test]

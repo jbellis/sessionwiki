@@ -7,6 +7,7 @@ use crate::util::short_id;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -86,11 +87,12 @@ struct PayloadRouting {
     kind: Option<String>,
     item: Option<ItemRouting>,
     call_id: Option<String>,
-    role: Option<String>,
+    turn_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ItemRouting {
+    id: Option<String>,
     #[serde(rename = "type")]
     kind: Option<String>,
     status: Option<String>,
@@ -109,33 +111,33 @@ impl Routing {
     }
 }
 
-fn conversation_line(line: &str) -> bool {
-    let Ok(route) = serde_json::from_str::<Routing>(line) else {
-        return false;
-    };
+fn dialogue_route(tags: (&str, Option<&str>, Option<&str>)) -> bool {
     matches!(
-        route.tags(),
+        tags,
         ("message", _, _)
             | ("response_item", Some("message"), _)
-            | (
-                "event_msg",
-                Some(
-                    "user_message"
-                        | "agent_message"
-                        | "task_started"
-                        | "turn_started"
-                        | "task_complete"
-                        | "turn_complete"
-                        | "turn_aborted"
-                ),
-                _
-            )
+            | ("event_msg", Some("user_message" | "agent_message"), _)
             | (
                 "event_msg",
                 Some("item_completed"),
-                Some("UserMessage" | "AgentMessage" | "ContextCompaction")
+                Some("UserMessage" | "AgentMessage")
             )
     )
+}
+
+fn turn_boundary<'a>(
+    kind: &str,
+    payload_kind: Option<&str>,
+    turn_id: Option<&'a str>,
+) -> Option<&'a str> {
+    if kind != "event_msg" {
+        return None;
+    }
+    match payload_kind {
+        Some("task_started" | "turn_started") => Some(turn_id.unwrap_or_default()),
+        Some("task_complete" | "turn_complete" | "turn_aborted") => Some(""),
+        _ => None,
+    }
 }
 
 fn rollout_suffix(path: &Path) -> Option<String> {
@@ -210,10 +212,17 @@ impl Adapter for Codex {
         // Over the byte cap: window (head+tail) instead of dropping the session.
         // Past the cap, the conversation is still read from the middle; only
         // its tool calls and output are windowed.
-        let (lines, windowed) = crate::util::session_lines_keeping(path, conversation_line)?;
+        let (lines, windowed) = crate::util::numbered_session_lines(path)?;
 
         let mut messages: Vec<Message> = Vec::new();
         let mut evidence = RolloutEvidence::default();
+        let mut streamed = if windowed {
+            evidence.scan(path, &lines)?
+        } else {
+            Vec::new()
+        }
+        .into_iter()
+        .peekable();
         let mut mirrors = DialogueMirrors::default();
         // An MCP call's failure is stated only in its `mcp_tool_call_end` event;
         // the `function_call_output` carries the text alone.
@@ -221,12 +230,26 @@ impl Adapter for Codex {
             std::collections::HashSet::new();
         let mut started = None;
         let mut ended = None;
+        let mut observe_timestamp = |ts| {
+            if let Some(ts) = ts {
+                started = started.or(Some(ts));
+                ended = Some(ts);
+            }
+        };
         // Some rollouts record an MCP call only as its end event. Those are
         // indexed from the event, unless a `function_call` already stands for
         // the same call - by id, or by identical arguments under another id.
         let (function_call_ids, function_call_args) = function_calls(&lines);
 
-        for line in &lines {
+        for (ordinal, line) in &lines {
+            while streamed
+                .peek()
+                .is_some_and(|(position, _)| position <= ordinal)
+            {
+                let (_, message) = streamed.next().unwrap();
+                observe_timestamp(message.ts);
+                messages.push(message);
+            }
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
@@ -235,37 +258,40 @@ impl Adapter for Codex {
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .and_then(parse_ts);
-            if let Some(t) = ts {
-                if started.is_none() {
-                    started = Some(t);
-                }
-                ended = Some(t);
-            }
+            observe_timestamp(ts);
 
-            let dialogue = Dialogue::from_record(&v);
             if !windowed {
-                evidence.observe(&v, dialogue.as_ref());
+                evidence.observe(&v);
+                let tags = (
+                    v["type"].as_str().unwrap_or_default(),
+                    v["payload"]["type"].as_str(),
+                    v["payload"]["item"]["type"].as_str(),
+                );
+                if dialogue_route(tags) {
+                    if let Ok(row) = serde_json::from_str::<StreamedDialogue>(line) {
+                        if let Some((dialogue, turn)) = row.project(tags) {
+                            evidence.saw_prompt |= dialogue.role == Role::User;
+                            if mirrors.first_occurrence(turn, &dialogue) {
+                                messages.push(dialogue.into_message(ts));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if v["type"] == "event_msg"
                     && v["payload"]["type"] == "item_completed"
                     && v["payload"]["item"]["type"] == "FileChange"
                 {
-                    evidence.file_change(line, v["payload"]["item"]["status"].as_str(), ts);
+                    let item = &v["payload"]["item"];
+                    evidence.file_change(line, item["id"].as_str(), item["status"].as_str(), ts);
                 }
-            }
-            if v["type"] == "event_msg" {
-                match v["payload"]["type"].as_str() {
-                    Some("task_started" | "turn_started") => {
-                        mirrors.begin(v["payload"]["turn_id"].as_str().unwrap_or_default());
-                    }
-                    Some("task_complete" | "turn_complete" | "turn_aborted") => mirrors.begin(""),
-                    _ => {}
+                if let Some(turn) = turn_boundary(
+                    v["type"].as_str().unwrap_or_default(),
+                    v["payload"]["type"].as_str(),
+                    v["payload"]["turn_id"].as_str(),
+                ) {
+                    mirrors.begin(turn);
                 }
-            }
-            if let Some(dialogue) = dialogue {
-                if mirrors.first_occurrence(&v, &dialogue) {
-                    push(&mut messages, dialogue.role, &dialogue.text, ts);
-                }
-                continue;
             }
 
             match v["type"].as_str() {
@@ -396,8 +422,9 @@ impl Adapter for Codex {
             }
         }
 
-        if windowed {
-            crate::util::for_each_line(path, |line| evidence.scan_line(line))?;
+        for (_, message) in streamed {
+            observe_timestamp(message.ts);
+            messages.push(message);
         }
 
         for message in &mut messages {
@@ -458,58 +485,60 @@ struct Dialogue {
     role: Role,
     source: Option<DialogueSource>,
     text: String,
+    key: [u8; 32],
 }
 
 impl Dialogue {
-    fn from_record(record: &Value) -> Option<Self> {
-        let payload = &record["payload"];
-        let (role, source, content) = match (record["type"].as_str(), payload["type"].as_str()) {
-            (Some("message"), _) => (dialogue_role(record)?, None, &record["content"]),
-            (Some("response_item"), Some("message")) => (
-                dialogue_role(payload)?,
-                Some(DialogueSource::Response),
-                &payload["content"],
-            ),
-            (Some("event_msg"), Some("user_message" | "agent_message")) => {
-                let role = if payload["type"] == "user_message" {
-                    Role::User
-                } else {
-                    Role::Assistant
-                };
-                (role, Some(DialogueSource::LegacyEvent), &payload["message"])
-            }
-            (Some("event_msg"), Some("item_completed")) => {
-                let item = &payload["item"];
-                let role = match item["type"].as_str()? {
-                    "UserMessage" => Role::User,
-                    "AgentMessage" => Role::Assistant,
-                    _ => return None,
-                };
-                (role, Some(DialogueSource::Completed), &item["content"])
-            }
-            _ => return None,
-        };
-        let include = |s: &str| !s.trim().is_empty() && !(role == Role::User && is_boilerplate(s));
-        let text = if source.is_some_and(|s| matches!(s, DialogueSource::LegacyEvent)) {
-            let text = content.as_str()?;
-            include(text).then(|| text.trim().to_owned())?
-        } else {
-            content
-                .as_array()?
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .filter(|text| include(text))
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_owned()
-        };
-        (!text.is_empty()).then_some(Self { role, source, text })
+    fn from_parts<'a>(
+        role: Role,
+        source: Option<DialogueSource>,
+        parts: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Self> {
+        let text = parts
+            .into_iter()
+            .filter(|text| !text.trim().is_empty() && (role != Role::User || !is_boilerplate(text)))
+            .flat_map(|text| {
+                // Model-input attachments carry separate XML-like label blocks.
+                // Skip those labels while keeping the user's adjacent text.
+                text.split('\n').filter(move |line| {
+                    role != Role::User
+                        || !matches!(source, Some(DialogueSource::Response))
+                        || !attachment_label(line.trim())
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_owned();
+        let normalized: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let key = Sha256::digest(normalized.as_bytes()).into();
+        (!text.is_empty()).then_some(Self {
+            role,
+            source,
+            text,
+            key,
+        })
+    }
+
+    fn into_message(self, ts: Option<chrono::DateTime<chrono::Utc>>) -> Message {
+        Message {
+            role: self.role,
+            text: self.text,
+            ts,
+            is_thought: false,
+            tool: None,
+        }
     }
 }
 
-fn dialogue_role(value: &Value) -> Option<Role> {
-    match value["role"].as_str()? {
+fn attachment_label(text: &str) -> bool {
+    matches!(text, "<audio>" | "</audio>" | "<image>" | "</image>")
+        || (text.ends_with('>')
+            && (text.starts_with("<audio name=") || text.starts_with("<image name=")))
+}
+
+fn role_name(name: &str) -> Option<Role> {
+    match name {
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
         _ => None,
@@ -534,15 +563,11 @@ impl DialogueMirrors {
         }
     }
 
-    fn first_occurrence(&mut self, record: &Value, message: &Dialogue) -> bool {
+    fn first_occurrence(&mut self, turn: Option<&str>, message: &Dialogue) -> bool {
         let Some(source) = message.source else {
             return true;
         };
-        let explicit = record["payload"]["turn_id"]
-            .as_str()
-            .or_else(|| record["payload"]["item"]["turn_id"].as_str())
-            .or_else(|| record["turn_id"].as_str())
-            .filter(|id| !id.is_empty());
+        let explicit = turn.filter(|id| !id.is_empty());
         // A newly seen explicit ID can arrive after its untagged mirrors.
         // Once known, it also lets late records resolve to their own turn.
         if let Some(id) = explicit {
@@ -580,8 +605,8 @@ impl DialogueMirrors {
 
 #[derive(Default)]
 struct TurnDialogue {
-    user: HashMap<String, [usize; 3]>,
-    assistant: HashMap<String, [usize; 3]>,
+    user: HashMap<[u8; 32], [usize; 3]>,
+    assistant: HashMap<[u8; 32], [usize; 3]>,
 }
 
 impl TurnDialogue {
@@ -591,7 +616,7 @@ impl TurnDialogue {
         } else {
             &self.assistant
         };
-        by_text.get(&dialogue.text).is_none_or(|counts| {
+        by_text.get(&dialogue.key).is_none_or(|counts| {
             counts[source as usize] == counts.iter().copied().max().unwrap_or_default()
         })
     }
@@ -603,7 +628,7 @@ impl TurnDialogue {
         } else {
             &mut self.assistant
         };
-        let counts = by_text.entry(dialogue.text.clone()).or_default();
+        let counts = by_text.entry(dialogue.key).or_default();
         // The nth occurrence from a source matches the nth occurrence of
         // this text in any other source. Emit at the first record's position.
         let first = counts[source] == counts.iter().copied().max().unwrap_or_default();
@@ -614,9 +639,100 @@ impl TurnDialogue {
         if implicit && dialogue.role == Role::User && first && !self.assistant.is_empty() {
             self.assistant.clear();
             self.user.clear();
-            self.user.entry(dialogue.text.clone()).or_default()[source] = 1;
+            self.user.entry(dialogue.key).or_default()[source] = 1;
         }
         first
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamedDialogue {
+    timestamp: Option<String>,
+    role: Option<String>,
+    turn_id: Option<String>,
+    content: Option<Vec<TextBlock>>,
+    payload: Option<StreamedPayload>,
+}
+
+#[derive(Deserialize)]
+struct TextBlock {
+    #[serde(default)]
+    text: Value,
+}
+
+#[derive(Deserialize)]
+struct StreamedPayload {
+    turn_id: Option<String>,
+    role: Option<String>,
+    content: Option<Vec<TextBlock>>,
+    message: Option<String>,
+    item: Option<StreamedItem>,
+}
+
+#[derive(Deserialize)]
+struct StreamedItem {
+    turn_id: Option<String>,
+    content: Option<Vec<TextBlock>>,
+}
+
+impl StreamedDialogue {
+    fn project(
+        &self,
+        tags: (&str, Option<&str>, Option<&str>),
+    ) -> Option<(Dialogue, Option<&str>)> {
+        let blocks = |role, source, content: &[TextBlock]| {
+            Dialogue::from_parts(
+                role,
+                source,
+                content.iter().filter_map(|block| block.text.as_str()),
+            )
+        };
+        let payload = self.payload.as_ref();
+        let turn = payload
+            .and_then(|p| p.turn_id.as_deref())
+            .or_else(|| payload?.item.as_ref()?.turn_id.as_deref())
+            .or(self.turn_id.as_deref());
+        let dialogue = match tags {
+            ("message", _, _) => blocks(
+                role_name(self.role.as_deref()?)?,
+                None,
+                self.content.as_deref()?,
+            )?,
+            ("response_item", Some("message"), _) => {
+                let payload = payload?;
+                blocks(
+                    role_name(payload.role.as_deref()?)?,
+                    Some(DialogueSource::Response),
+                    payload.content.as_deref()?,
+                )?
+            }
+            ("event_msg", Some("user_message" | "agent_message"), _) => {
+                let role = if tags.1 == Some("user_message") {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                Dialogue::from_parts(
+                    role,
+                    Some(DialogueSource::LegacyEvent),
+                    [payload?.message.as_deref()?],
+                )?
+            }
+            ("event_msg", Some("item_completed"), Some("UserMessage" | "AgentMessage")) => {
+                let role = if tags.2 == Some("UserMessage") {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                blocks(
+                    role,
+                    Some(DialogueSource::Completed),
+                    payload?.item.as_ref()?.content.as_deref()?,
+                )?
+            }
+            _ => return None,
+        };
+        Some((dialogue, turn))
     }
 }
 
@@ -634,12 +750,62 @@ struct RolloutEvidence {
 }
 
 impl RolloutEvidence {
-    // The dialogue budget can drop records anywhere in the source. Read the
-    // routing tags first so large compaction/tool payloads are skipped.
-    fn scan_line(&mut self, line: &str) {
-        let Ok(route) = serde_json::from_str::<Routing>(line) else {
-            return;
-        };
+    // Read compact dialogue and evidence from the whole file. Only emitted
+    // text from the middle counts against the dialogue budget.
+    fn scan(
+        &mut self,
+        path: &Path,
+        raw_window: &[(usize, String)],
+    ) -> Result<Vec<(usize, Message)>> {
+        let mut dialogue = Vec::new();
+        let mut mirrors = DialogueMirrors::default();
+        let mut remaining = crate::util::middle_kept_bytes();
+        let mut ordinal = 0;
+        crate::util::for_each_line(path, |line| {
+            let position = ordinal;
+            ordinal += 1;
+            let Ok(route) = serde_json::from_str::<Routing>(line) else {
+                return;
+            };
+            let tags = route.tags();
+            if let Some(turn) = turn_boundary(
+                tags.0,
+                tags.1,
+                route.payload.as_ref().and_then(|p| p.turn_id.as_deref()),
+            ) {
+                mirrors.begin(turn);
+            }
+            if !dialogue_route(tags) {
+                self.scan_evidence(&route, line);
+                return;
+            }
+            let Ok(row) = serde_json::from_str::<StreamedDialogue>(line) else {
+                return;
+            };
+            let Some((message, turn)) = row.project(tags) else {
+                return;
+            };
+            self.saw_prompt |= message.role == Role::User;
+            if !mirrors.first_occurrence(turn, &message) {
+                return;
+            }
+            if raw_window
+                .binary_search_by_key(&position, |(i, _)| *i)
+                .is_err()
+            {
+                let bytes = message.text.len() as u64;
+                if bytes > remaining {
+                    return;
+                }
+                remaining -= bytes;
+            }
+            let ts = row.timestamp.as_deref().and_then(parse_ts);
+            dialogue.push((position, message.into_message(ts)));
+        })?;
+        Ok(dialogue)
+    }
+
+    fn scan_evidence(&mut self, route: &Routing, line: &str) {
         match route.tags() {
             ("compacted", _, _)
             | ("response_item", Some("compaction"), _)
@@ -648,12 +814,9 @@ impl RolloutEvidence {
                 return;
             }
             ("event_msg", Some("item_completed"), Some("FileChange")) => {
-                let status = route
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.item.as_ref())
-                    .and_then(|item| item.status.as_deref());
-                self.file_change(line, status, None);
+                if let Some(item) = route.payload.as_ref().and_then(|p| p.item.as_ref()) {
+                    self.file_change(line, item.id.as_deref(), item.status.as_deref(), None);
+                }
                 return;
             }
             ("response_item", Some("function_call_output" | "custom_tool_call_output"), _) => {
@@ -666,25 +829,16 @@ impl RolloutEvidence {
                     return;
                 }
             }
-            ("response_item", Some("message"), _)
-                if route
-                    .payload
-                    .as_ref()
-                    .is_some_and(|p| p.role.as_deref() == Some("user")) => {}
-            ("session_meta" | "message", _, _)
-            | ("event_msg", Some("user_message"), _)
-            | ("event_msg", Some("item_completed"), Some("UserMessage"))
+            ("session_meta", _, _)
             | ("response_item", Some("function_call" | "custom_tool_call"), _) => {}
             _ => return,
         }
         if let Ok(record) = serde_json::from_str::<Value>(line) {
-            let dialogue = Dialogue::from_record(&record);
-            self.observe(&record, dialogue.as_ref());
+            self.observe(&record);
         }
     }
 
-    fn observe(&mut self, record: &Value, dialogue: Option<&Dialogue>) {
-        self.saw_prompt |= dialogue.is_some_and(|d| d.role == Role::User);
+    fn observe(&mut self, record: &Value) {
         let payload = &record["payload"];
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("session_meta"), _) => {
@@ -723,10 +877,14 @@ impl RolloutEvidence {
     fn file_change(
         &mut self,
         line: &str,
+        id: Option<&str>,
         status: Option<&str>,
         ts: Option<chrono::DateTime<chrono::Utc>>,
     ) {
         self.has_file_change = true;
+        if let (Some(id), Some("failed" | "declined")) = (id, status) {
+            self.patches.failed.insert(id.to_owned());
+        }
         if status != Some("completed") {
             return;
         }
@@ -920,7 +1078,10 @@ impl Patches {
         };
         let verify_failed = output.contains(Self::VERIFY_FAILED);
         let failed = if direct {
-            is_error || verify_failed || output.starts_with("aborted by user")
+            is_error
+                || verify_failed
+                || output.trim_start().starts_with("aborted by user")
+                || output.trim_start().starts_with("patch rejected by user")
         } else {
             is_error && verify_failed
         };
@@ -958,10 +1119,10 @@ fn call_id(payload: &Value) -> Option<String> {
 }
 
 /// The ids and parsed arguments of every `function_call` in a rollout.
-fn function_calls(lines: &[String]) -> (std::collections::HashSet<String>, Vec<Value>) {
+fn function_calls(lines: &[(usize, String)]) -> (std::collections::HashSet<String>, Vec<Value>) {
     let mut ids = std::collections::HashSet::new();
     let mut args = Vec::new();
-    for line in lines {
+    for (_, line) in lines {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -1107,7 +1268,7 @@ fn push(
     if !text.is_empty() {
         messages.push(Message {
             role,
-            text: text.to_string(),
+            text: text.to_owned(),
             ts,
             is_thought: false,
             tool: None,
@@ -1294,6 +1455,134 @@ mod tests {
         assert_eq!(
             actual,
             [(Role::User, "repeat"), (Role::Assistant, "same reply")].repeat(2)
+        );
+    }
+
+    #[test]
+    fn declined_and_failed_file_changes_cancel_the_raw_patch_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let call = |id, path| {
+            json!({
+                "type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch",
+                    "call_id":id,"input":format!("*** Begin Patch\n*** Add File: {path}\n+content\n*** End Patch")}
+            })
+        };
+        let result = json!({
+            "type":"response_item","payload":{"type":"custom_tool_call_output",
+                "call_id":"legacy","output":"patch rejected by user"}
+        });
+        let settle = |id, status, path: &str| {
+            json!({
+                "type":"event_msg","payload":{"type":"item_completed","item":{
+                    "type":"FileChange","id":id,"status":status,"changes":{path:{}}}}
+            })
+        };
+        let records = [
+            call("declined", "declined.rs"),
+            settle("declined", "declined", "declined.rs"),
+            settle("failed", "failed", "failed.rs"),
+            call("failed", "failed.rs"),
+            call("legacy", "legacy.rs"),
+            result,
+            call("success", "success.rs"),
+            settle("success", "completed", "success.rs"),
+        ];
+        write_rollout(&file, &records);
+        for window in [None, Some((140, 30, 30))] {
+            crate::util::TEST_WINDOW.with(|w| w.set(window));
+            let session = Codex::default().parse(&file).unwrap();
+            crate::util::TEST_WINDOW.with(|w| w.set(None));
+            assert_eq!(session.touched, ["success.rs"]);
+            assert_eq!(session.operational_edited_paths, ["success.rs"]);
+        }
+    }
+
+    #[test]
+    fn dialogue_reconciles_attachment_labels_and_legacy_chunk_concatenation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let mut response = dialogue_fixture(0, Role::User, "Describe this", Some("one"));
+        response["payload"]["content"] = json!([
+            {"type":"input_text","text":"Describe this"},
+            {"type":"input_text","text":"<audio name=[Audio #1] path=\"/local.wav\">"},
+            {"type":"input_audio","input_audio":{"data":"QUJD","format":"wav"}},
+            {"type":"input_text","text":"</audio>"}
+        ]);
+        let mut completion = dialogue_fixture(2, Role::User, "Describe this", Some("one"));
+        completion["payload"]["item"]["content"] = json!([
+            {"type":"text","text":"Describe this"},
+            {"type":"localAudio","path":"/local.wav"}
+        ]);
+        let attachment = [
+            response,
+            completion,
+            dialogue_fixture(1, Role::User, "Describe this", Some("one")),
+        ];
+        let chunks = [
+            dialogue_fixture(0, Role::User, "Explain this\ncode", Some("two")),
+            dialogue_fixture(1, Role::User, "Explain thiscode", Some("two")),
+            dialogue_fixture(2, Role::User, "Explain this\ncode", Some("two")),
+        ];
+        for order in [[0, 1, 2], [1, 2, 0], [2, 0, 1]] {
+            let records = order
+                .iter()
+                .map(|&i| attachment[i].clone())
+                .chain(order.iter().map(|&i| chunks[i].clone()))
+                .collect::<Vec<_>>();
+            write_rollout(&file, &records);
+            for window in [None, Some((150, 30, 30))] {
+                crate::util::TEST_WINDOW.with(|w| w.set(window));
+                let session = Codex::default().parse(&file).unwrap();
+                crate::util::TEST_WINDOW.with(|w| w.set(None));
+                let prompts = session
+                    .messages
+                    .iter()
+                    .map(|m| m.text.as_str())
+                    .collect::<Vec<_>>();
+                let first_chunks = if order[0] == 1 {
+                    "Explain thiscode"
+                } else {
+                    "Explain this\ncode"
+                };
+                assert_eq!(prompts, ["Describe this", first_chunks]);
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_dialogue_budget_excludes_media_and_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let first = "A".repeat(95);
+        let mut response = dialogue_fixture(0, Role::User, &first, Some("one"));
+        response["payload"]["content"].as_array_mut().unwrap().extend([
+            json!({"type":"input_image","image_url":format!("data:image/png;base64,{}", "A".repeat(8000))}),
+            json!({"type":"input_audio","input_audio":{"data":"A".repeat(8000)}}),
+        ]);
+        let records = [
+            json!({"type":"session_meta","payload":{"cwd":"/repo"}}),
+            response,
+            dialogue_fixture(1, Role::User, &first, Some("one")),
+            dialogue_fixture(2, Role::User, &first, Some("one")),
+            dialogue_fixture(2, Role::Assistant, "middle reply", Some("one")),
+            dialogue_fixture(2, Role::User, "later middle prompt", Some("two")),
+            json!({"type":"response_item","payload":{"type":"function_call_output","output":"tail".repeat(100)}}),
+        ];
+        write_rollout(&file, &records);
+        crate::util::TEST_WINDOW.with(|w| w.set(Some((240, 60, 60))));
+        crate::util::TEST_MIDDLE_BYTES.with(|w| w.set(Some(150)));
+        let session = Codex::default().parse(&file).unwrap();
+        crate::util::TEST_WINDOW.with(|w| w.set(None));
+        crate::util::TEST_MIDDLE_BYTES.with(|w| w.set(None));
+        assert!(session.title.starts_with("[large]"));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            [first.as_str(), "middle reply", "later middle prompt"]
         );
     }
 
@@ -1661,7 +1950,7 @@ mod tests {
     /// merely mentions `user_message` is not conversation either.
     #[test]
     fn only_conversation_records_are_kept_from_the_middle() {
-        let t = |line: &str| conversation_line(line);
+        let t = |line: &str| dialogue_route(serde_json::from_str::<Routing>(line).unwrap().tags());
         assert!(t(
             r#"{"timestamp":"t","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#
         ));
