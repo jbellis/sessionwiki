@@ -315,6 +315,7 @@ mod tests {
             role,
             text: text.to_string(),
             ts: None,
+            is_thought: false,
             tool: None,
         }
     }
@@ -330,6 +331,9 @@ mod tests {
             title: "refactor token guard".into(),
             subagent: false,
             messages,
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec![],
             edits: Vec::new(),
         }

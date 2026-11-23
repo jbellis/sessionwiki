@@ -78,8 +78,12 @@ impl Adapter for OneChat {
                 role: Role::User,
                 text: "hello".into(),
                 ts: None,
+                is_thought: false,
                 tool: None,
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec![],
             edits: vec![],
         })

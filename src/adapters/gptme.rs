@@ -163,6 +163,9 @@ impl Adapter for Gptme {
             title,
             subagent: false,
             messages,
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: Vec::new(),
             edits: Vec::new(),
         })
@@ -339,6 +342,7 @@ fn push(
             role,
             text: text.to_owned(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }

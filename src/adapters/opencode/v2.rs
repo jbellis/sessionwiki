@@ -17,8 +17,8 @@ pub(super) fn parse(
     sid: &str,
     key: &str,
 ) -> Result<Session> {
-    let (project, raw_title, created, updated, parent): (
-        String,
+    let (raw_cwd, raw_title, created, updated, parent): (
+        Option<String>,
         String,
         Option<i64>,
         Option<i64>,
@@ -29,7 +29,7 @@ pub(super) fn parse(
         params![sid],
         |r| {
             Ok((
-                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get(0)?,
                 r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 r.get(2)?,
                 r.get(3)?,
@@ -156,12 +156,15 @@ pub(super) fn parse(
         id: short_id(key),
         tool,
         path: PathBuf::from(display_path(key)),
-        project,
+        project: raw_cwd.clone().unwrap_or_default(),
         started: created.and_then(DateTime::from_timestamp_millis),
         ended: updated.and_then(DateTime::from_timestamp_millis),
         title,
         subagent: parent.is_some_and(|p| !p.is_empty()),
         messages,
+        raw_cwd,
+        operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
+        compacted_prefix: false,
         touched: dedup_paths(touched),
         edits,
     })
@@ -240,11 +243,9 @@ fn emit_tool_part_v2(
     if let Some(path) =
         edited_path_v2(&tool_lower, input).filter(|_| status == Some("completed") && !is_error)
     {
-        if let Some(clean) = clean_path(&path) {
-            touched.push(clean);
-            if let Some(ev) = edit_event_v2(&tool_lower, input, ts) {
-                edits.push(ev);
-            }
+        touched.push(path);
+        if let Some(ev) = edit_event_v2(&tool_lower, input, ts) {
+            edits.push(ev);
         }
     }
 

@@ -215,6 +215,7 @@ impl Adapter for Prodex {
                 role: Role::User,
                 text: prompt,
                 ts: started,
+                is_thought: false,
                 tool: None,
             });
         }
@@ -264,6 +265,7 @@ impl Adapter for Prodex {
                     role: Role::Assistant,
                     text,
                     ts: ended.or(started),
+                    is_thought: false,
                     tool: None,
                 });
             }
@@ -293,6 +295,9 @@ impl Adapter for Prodex {
             title,
             subagent: false,
             messages,
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched,
             edits: Vec::new(),
         })

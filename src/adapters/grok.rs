@@ -8,7 +8,7 @@ use crate::util::{read_to_string_capped, short_id};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +48,10 @@ impl GrokBuild {
 }
 
 impl Adapter for GrokBuild {
+    fn native_id(&self, key: &str) -> Option<String> {
+        super::directory_name(Path::new(key))
+    }
+
     fn name(&self) -> &'static str {
         "grok-build"
     }
@@ -155,12 +159,17 @@ impl Adapter for GrokBuild {
             .ok()
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .unwrap_or(Value::Null);
-        let cwd = summary
-            .pointer("/info/cwd")
-            .and_then(Value::as_str)
-            .filter(|p| Path::new(p).is_absolute())
-            .map(str::to_owned)
-            .or_else(|| path.parent().and_then(decode_cwd));
+        let summary_cwd = summary.pointer("/info/cwd").and_then(super::nonblank);
+        let mut directory_cwd = None;
+        if summary_cwd.is_none_or(|cwd| !Path::new(cwd).is_absolute()) {
+            directory_cwd = path.parent().and_then(decode_cwd);
+        }
+        let project = summary_cwd
+            .filter(|cwd| Path::new(cwd).is_absolute())
+            .or(directory_cwd.as_deref())
+            .unwrap_or_default()
+            .to_owned();
+        let raw_cwd = summary_cwd.or(directory_cwd.as_deref()).map(str::to_owned);
         let history = if path.join("chat_history.jsonl").is_file() {
             path.join("chat_history.jsonl")
         } else {
@@ -181,12 +190,14 @@ impl Adapter for GrokBuild {
             .and_then(timestamp)
             .or_else(|| timestamp(&summary["updated_at"]));
         let mut messages = Vec::new();
-        let mut edit_calls = HashMap::new();
-        let mut completed = HashSet::new();
+        let mut evidence = HistoryEvidence::default();
         for line in lines {
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if !windowed {
+                evidence.observe(&record);
+            }
             let ts = ["timestamp", "time", "created_at"]
                 .into_iter()
                 .find_map(|k| timestamp(&record[k]));
@@ -225,11 +236,6 @@ impl Adapter for GrokBuild {
                                 .unwrap_or_else(|_| Value::String(text.clone())),
                             value => value.clone(),
                         };
-                        if name == "search_replace" {
-                            if let (Some(id), Some(path)) = (&id, args["file_path"].as_str()) {
-                                edit_calls.insert(id.clone(), path.to_owned());
-                            }
-                        }
                         redact_json(&mut args);
                         messages.push(Message::tool_call(
                             ts,
@@ -250,18 +256,21 @@ impl Adapter for GrokBuild {
                         .filter_map(|p| p["text"].as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
-                    push_text(&mut messages, Role::Assistant, &text, ts);
+                    if !text.is_empty() {
+                        messages.push(Message {
+                            role: Role::Assistant,
+                            text: crate::redact::redact(&text).into_owned(),
+                            ts,
+                            is_thought: true,
+                            tool: None,
+                        });
+                    }
                 }
                 Some("tool_result") => {
                     let call_id = record["tool_call_id"].as_str().map(str::to_owned);
                     // Native results carry no success flag. As in mj's reader,
                     // completion is evidence that search_replace actually ran.
                     let is_error = record["is_error"].as_bool().unwrap_or(false);
-                    if !is_error {
-                        if let Some(id) = &call_id {
-                            completed.insert(id.clone());
-                        }
-                    }
                     messages.push(Message::tool_result(
                         ts,
                         ToolResult {
@@ -286,21 +295,20 @@ impl Adapter for GrokBuild {
             .ok()
             .and_then(|m| m.modified().ok())
             .map(DateTime::<Utc>::from);
-        let touched = if windowed {
-            // The result proving an edit ran may fall outside the text window.
-            history_edits(&history)?
-        } else {
-            edit_calls
-                .into_iter()
-                .filter(|(id, _)| completed.contains(id))
-                .map(|(_, path)| path)
-                .collect()
-        };
+        if windowed {
+            crate::util::for_each_line(&history, |line| {
+                if let Ok(record) = serde_json::from_str(line) {
+                    evidence.observe(&record);
+                }
+            })?;
+        }
+        let compacted_prefix = evidence.compacted_prefix;
+        let touched = evidence.applied();
         Ok(Session {
             id: short_id(&path.to_string_lossy()),
             tool: self.name(),
             path,
-            project: cwd.unwrap_or_default(),
+            project,
             started: started.or(modified),
             ended: ended.or(modified),
             title: if windowed {
@@ -310,49 +318,73 @@ impl Adapter for GrokBuild {
             },
             subagent: false,
             messages,
+            raw_cwd,
+            operational_edited_paths: super::dedup_raw_paths(touched.clone()),
+            compacted_prefix,
             touched: dedup_paths(touched),
             edits: Vec::new(),
         })
     }
 }
 
-fn history_edits(path: &Path) -> Result<Vec<String>> {
-    let mut calls = HashMap::new();
-    let mut completed = HashSet::new();
-    crate::util::for_each_line(path, |line| {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
+#[derive(Default)]
+struct HistoryEvidence {
+    calls: Vec<(String, String)>,
+    completed: HashSet<String>,
+    saw_prompt: bool,
+    compacted_prefix: bool,
+}
+
+impl HistoryEvidence {
+    fn observe(&mut self, record: &Value) {
+        if record["synthetic_reason"] == "compaction_meta" {
+            self.compacted_prefix |= !self.saw_prompt;
             return;
-        };
+        }
         match record["type"].as_str() {
+            Some("user")
+                if matches!(
+                    record["synthetic_reason"].as_str(),
+                    None | Some("human" | "interjection")
+                ) =>
+            {
+                self.saw_prompt |= !content_text(&record["content"]).trim().is_empty();
+            }
             Some("assistant") => {
                 for call in record["tool_calls"].as_array().into_iter().flatten() {
-                    if call["name"].as_str() != Some("search_replace") {
+                    if call["name"] != "search_replace" {
                         continue;
                     }
-                    let args = match &call["arguments"] {
-                        Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
-                        value => value.clone(),
+                    let parsed;
+                    let args = if let Some(text) = call["arguments"].as_str() {
+                        parsed = serde_json::from_str(text).unwrap_or(Value::Null);
+                        &parsed
+                    } else {
+                        &call["arguments"]
                     };
                     if let (Some(id), Some(path)) =
                         (call["id"].as_str(), args["file_path"].as_str())
                     {
-                        calls.insert(id.to_owned(), path.to_owned());
+                        self.calls.push((id.to_owned(), path.to_owned()));
                     }
                 }
             }
-            Some("tool_result") if record["is_error"].as_bool() != Some(true) => {
+            Some("tool_result") if record["is_error"] != true => {
                 if let Some(id) = record["tool_call_id"].as_str() {
-                    completed.insert(id.to_owned());
+                    self.completed.insert(id.to_owned());
                 }
             }
             _ => {}
         }
-    })?;
-    Ok(calls
-        .into_iter()
-        .filter(|(id, _)| completed.contains(id))
-        .map(|(_, path)| path)
-        .collect())
+    }
+
+    fn applied(self) -> Vec<String> {
+        self.calls
+            .into_iter()
+            .filter(|(id, _)| self.completed.contains(id))
+            .map(|(_, path)| path)
+            .collect()
+    }
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -437,7 +469,7 @@ fn decode_cwd(directory: &Path) -> Option<String> {
     decoded.or_else(|| {
         read_to_string_capped(&directory.join(".cwd"))
             .ok()
-            .map(|text| text.trim().to_owned())
+            .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
             .filter(|p| Path::new(p).is_absolute())
     })
 }
@@ -484,6 +516,7 @@ fn push_text(messages: &mut Vec<Message>, role: Role, text: &str, ts: Option<Dat
             role,
             text: crate::redact::redact(text).into_owned(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }

@@ -109,6 +109,17 @@ fn sessions_root_at(home: &Path, config: Option<&Path>, data: Option<&Path>) -> 
 }
 
 impl Adapter for Muse {
+    fn native_id(&self, key: &str) -> Option<String> {
+        let path = Path::new(key);
+        let parent = super::directory_name(path.parent()?);
+        if path.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            if let Some(id) = first_stream(path).ok().flatten() {
+                return Some(id);
+            }
+        }
+        parent
+    }
+
     fn name(&self) -> &'static str {
         "muse"
     }
@@ -219,13 +230,13 @@ impl Adapter for Muse {
         let (lines, windowed) = crate::util::session_lines(path)?;
         // A retained permission frame may precede the first ordinary record.
         // Determine the outer stream first to exclude unrelated child streams.
-        let stream = lines.iter().find_map(|line| {
-            let value: Value = serde_json::from_str(line).ok()?;
-            if value.get("retained_frame").is_some() || !supported_record(&value) {
-                return None;
-            }
-            value.pointer("/stream/id")?.as_str().map(str::to_owned)
-        });
+        let stream = if windowed {
+            first_stream(path)?
+        } else {
+            lines
+                .iter()
+                .find_map(|line| serde_json::from_str(line).ok().as_ref().and_then(stream_id))
+        };
         let mut projection = Projection::default();
         for line in lines {
             projection.line(&line, stream.as_deref());
@@ -239,7 +250,9 @@ impl Adapter for Muse {
                 ..Projection::default()
             };
             crate::util::for_each_line(path, |line| provenance.line(line, stream.as_deref()))?;
+            projection.cwd = provenance.cwd;
             projection.touched = provenance.touched;
+            projection.raw_paths = provenance.raw_paths;
         }
         let title = projection
             .title
@@ -248,12 +261,15 @@ impl Adapter for Muse {
             id: crate::util::short_id(&path.to_string_lossy()),
             tool: "muse",
             path: path.to_path_buf(),
-            project: projection.cwd.unwrap_or_default(),
+            project: projection.cwd.clone().unwrap_or_default(),
             started: projection.started,
             ended: projection.ended,
             title,
             subagent: false,
             messages: projection.messages,
+            raw_cwd: projection.cwd,
+            operational_edited_paths: super::dedup_raw_paths(projection.raw_paths),
+            compacted_prefix: false,
             touched: dedup_paths(projection.touched),
             edits: Vec::new(),
         })
@@ -297,6 +313,29 @@ fn valid_directory(path: &Path, depth: usize) -> bool {
         }
         _ => true,
     }
+}
+
+fn stream_id(value: &Value) -> Option<String> {
+    if value.get("retained_frame").is_some() || !supported_record(value) {
+        return None;
+    }
+    super::nonblank(value.pointer("/stream/id")?).map(str::to_owned)
+}
+
+fn first_stream(path: &Path) -> Result<Option<String>> {
+    let mut reader = crate::util::line_reader(path)?;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? > 0 {
+        if let Some(id) = serde_json::from_slice(&line)
+            .ok()
+            .as_ref()
+            .and_then(stream_id)
+        {
+            return Ok(Some(id));
+        }
+        line.clear();
+    }
+    Ok(None)
 }
 
 fn supported_record(value: &Value) -> bool {
@@ -404,6 +443,7 @@ struct Projection {
     ended: Option<DateTime<Utc>>,
     messages: Vec<Message>,
     touched: Vec<String>,
+    raw_paths: Vec<String>,
     records: HashSet<String>,
     intents: HashSet<String>,
     assistants: HashSet<String>,
@@ -432,12 +472,15 @@ impl Projection {
     }
 
     fn record(&mut self, value: &Value, retained: bool) {
-        if self.provenance_only
-            && !(value["payload_type"] == "runtime.session"
-                && value.pointer("/payload/kind").and_then(Value::as_str) == Some("run")
-                && value.pointer("/payload/event/kind").and_then(Value::as_str)
-                    == Some("assistant_tool_calls_committed"))
-        {
+        let payload = &value["payload"];
+        let event = &payload["event"];
+        let kind = event["kind"].as_str().unwrap_or_default();
+        let runtime = value["payload_type"] == "runtime.session";
+        let metadata = value["payload_type"] == "runtime.session.metadata" && !retained;
+        let committed =
+            runtime && payload["kind"] == "run" && kind == "assistant_tool_calls_committed";
+        let alternate = kind != "assistant_tool_calls_committed" && kind.contains("tool_call");
+        if self.provenance_only && !(metadata || committed || alternate) {
             return;
         }
         if !first_id(&mut self.records, value.get("id")) {
@@ -450,17 +493,22 @@ impl Projection {
             self.started = Some(self.started.map_or(ts, |old| old.min(ts)));
             self.ended = Some(self.ended.map_or(ts, |old| old.max(ts)));
         }
-        let payload = &value["payload"];
-        match value["payload_type"].as_str() {
-            Some("runtime.session.metadata") if !retained => {
-                if let Some(cwd) = payload
-                    .pointer("/record/workspace_root")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    self.cwd = Some(cwd.to_owned());
-                }
+        if metadata {
+            if let Some(cwd) = payload
+                .pointer("/record/workspace_root")
+                .and_then(super::nonblank)
+            {
+                self.cwd = Some(cwd.to_owned());
             }
+        }
+        if committed {
+            for call in event["tool_calls"].as_array().into_iter().flatten() {
+                collect_call_paths(call, &mut self.raw_paths);
+            }
+        } else if alternate {
+            collect_call_paths(event, &mut self.raw_paths);
+        }
+        match value["payload_type"].as_str() {
             Some("session.name.changed") if !retained => {
                 if let Some(title) = payload["new_name"]
                     .as_str()
@@ -514,6 +562,7 @@ impl Projection {
             role,
             text: crate::redact::redact(text).into_owned(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }
@@ -531,14 +580,7 @@ impl Projection {
             args = serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()));
         }
         redact_json_strings(&mut args);
-        let lower = name.to_ascii_lowercase();
-        if !lower.contains("read")
-            && [
-                "write", "edit", "patch", "replace", "rename", "delete", "move",
-            ]
-            .iter()
-            .any(|verb| lower.contains(verb))
-        {
+        if is_write_operation(name) {
             collect_paths(&args, &mut self.touched);
         }
         if self.provenance_only {
@@ -636,6 +678,33 @@ fn redact_json_strings(value: &mut Value) {
     }
 }
 
+fn is_write_operation(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !lower.contains("read")
+        && [
+            "write", "edit", "patch", "replace", "rename", "delete", "move",
+        ]
+        .iter()
+        .any(|verb| lower.contains(verb))
+}
+
+fn collect_call_paths(call: &Value, paths: &mut Vec<String>) {
+    let name = super::nonblank(&call["name"]).or_else(|| super::nonblank(&call["tool_name"]));
+    if !name.is_some_and(is_write_operation) {
+        return;
+    }
+    for key in ["arguments", "args", "input"] {
+        let args = &call[key];
+        if let Some(text) = args.as_str() {
+            if let Ok(decoded) = serde_json::from_str(text) {
+                collect_paths(&decoded, paths);
+            }
+        } else {
+            collect_paths(args, paths);
+        }
+    }
+}
+
 fn collect_paths(value: &Value, paths: &mut Vec<String>) {
     match value {
         Value::Object(values) => {
@@ -644,7 +713,7 @@ fn collect_paths(value: &Value, paths: &mut Vec<String>) {
                     key.as_str(),
                     "path" | "file_path" | "filePath" | "target_path" | "targetPath" | "filename"
                 ) {
-                    if let Some(path) = value.as_str() {
+                    if let Some(path) = super::nonblank(value) {
                         paths.push(path.to_owned());
                     }
                 }
@@ -1286,6 +1355,59 @@ mod tests {
             texts(&parsed.unwrap(), Role::User),
             ["first prompt", "latest prompt"]
         );
+    }
+
+    #[test]
+    fn windowed_sessions_keep_last_native_workspace_and_both_write_families() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = |sequence, cwd| {
+            record(
+                sequence,
+                "runtime.session.metadata",
+                json!({
+                    "record":{"workspace_root":cwd}
+                }),
+            )
+        };
+        let mut foreign = workspace(7, "/foreign");
+        foreign["stream"]["id"] = json!("foreign");
+        let records = [
+            workspace(1, "/head"),
+            intent(2, "head", "initial prompt"),
+            run(
+                3,
+                json!({"kind":"assistant_tool_calls_committed","tool_calls":[
+                {"name":"edit_file","args":{"file_path":"edit  "},"call_id":"edit"}]}),
+            ),
+            run(
+                4,
+                json!({"kind":"alternate_tool_call","tool_name":"rename_file",
+                    "input":"{\"nested\":[{\"targetPath\":\"sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 \"}]}"
+                }),
+            ),
+            run(
+                5,
+                json!({"kind":"tool_call_started","name":"read_or_write","args":{"path":"read"}}),
+            ),
+            workspace(6, "/middle/final  "),
+            foreign,
+            frame(vec![workspace(9, "/retained")]),
+            workspace(10, " "),
+            intent(11, "tail", "final prompt"),
+        ];
+        let path = write(directory.path(), "session-1/session.jsonl", &records);
+        let adapter = Muse::in_sessions_root(directory.path());
+        for window in [None, Some((400, 400, 400))] {
+            crate::util::TEST_WINDOW.with(|w| w.set(window));
+            let session = adapter.parse(&path).unwrap();
+            crate::util::TEST_WINDOW.with(|w| w.set(None));
+            assert_eq!(session.raw_cwd.as_deref(), Some("/middle/final  "));
+            assert_eq!(
+                session.operational_edited_paths,
+                ["edit  ", "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 "]
+            );
+            assert!(!session.compacted_prefix);
+        }
     }
 
     #[test]

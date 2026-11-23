@@ -135,6 +135,20 @@ fn change_token(files: &[PathBuf]) -> Result<i64> {
     Ok(((h.finish() & ((1 << 62) - 1)) | (1 << 62)) as i64)
 }
 impl Adapter for Antigravity {
+    fn native_id(&self, key: &str) -> Option<String> {
+        let path = Path::new(key);
+        let dir = if path.extension().is_some_and(|ext| ext == "jsonl")
+            || path
+                .parent()
+                .is_some_and(|p| p.ends_with(".system_generated/logs"))
+        {
+            conversation_dir(path)?
+        } else {
+            path
+        };
+        super::directory_name(dir)
+    }
+
     fn name(&self) -> &'static str {
         "antigravity"
     }
@@ -256,19 +270,20 @@ impl Adapter for Antigravity {
         if path.is_dir() {
             return self.parse_key(&path.to_string_lossy());
         }
-        let parent = path.parent().context("transcript has no parent")?;
-        let dir = if parent.file_name().is_some_and(|n| n == "logs") {
-            parent
-                .parent()
-                .and_then(Path::parent)
-                .context("invalid Antigravity log path")?
-        } else {
-            parent
-        };
+        let dir = conversation_dir(path).context("invalid Antigravity log path")?;
         let key = dir.to_string_lossy();
         Ok(self.with_summary(parse_transcript(path, &key)?, &key))
     }
 }
+fn conversation_dir(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if parent.ends_with(".system_generated/logs") {
+        parent.parent()?.parent()
+    } else {
+        Some(parent)
+    }
+}
+
 #[derive(Clone, Debug, Hash)]
 struct Summary {
     title: String,
@@ -281,6 +296,7 @@ impl Antigravity {
         let summary = self.summary(key);
         if let Some(summary) = summary {
             if !summary.project.is_empty() {
+                session.raw_cwd = Some(summary.project.clone());
                 session.project = summary.project;
             }
             if !summary.title.trim().is_empty() {
@@ -373,7 +389,7 @@ fn read_summaries(db: &Path, id: Option<&str>) -> Result<HashMap<String, Summary
                 _ => None,
             };
             let uris: Vec<String> = serde_json::from_str(&uris).unwrap_or_default();
-            let project = uris.first().and_then(|s| file_uri(s)).unwrap_or_default();
+            let project = uris.iter().find_map(|s| file_uri(s)).unwrap_or_default();
             out.insert(
                 id,
                 Summary {
@@ -419,6 +435,29 @@ fn file_uri(uri: &str) -> Option<String> {
     } else {
         decoded
     })
+}
+
+fn workspace_cwd(v: &Value) -> Option<String> {
+    ["workspaceUri", "workspace_uri", "cwd", "workspace"]
+        .iter()
+        .filter_map(|field| super::nonblank(&v[*field]))
+        .chain(
+            [
+                "/workspace/uri",
+                "/workspace/cwd",
+                "/metadata/cwd",
+                "/metadata/workspaceUri",
+            ]
+            .iter()
+            .filter_map(|p| v.pointer(p).and_then(super::nonblank)),
+        )
+        .find_map(|s| {
+            if s.starts_with("file://") {
+                file_uri(s)
+            } else {
+                Some(s.to_owned())
+            }
+        })
 }
 
 fn stamp(v: &Value) -> Option<DateTime<Utc>> {
@@ -476,7 +515,7 @@ fn edit(name: &str, input: &Value, ts: Option<DateTime<Utc>>) -> Option<EditEven
     .find_map(|k| input.get(k).and_then(Value::as_str))
     .unwrap_or("");
     Some(EditEvent {
-        path: clean_path(path)?,
+        path: path.to_owned(),
         kind,
         ts,
         snippet: redacted_truncate(text, 200),
@@ -505,7 +544,9 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
     let mut edits = Vec::new();
     let mut started: Option<DateTime<Utc>> = None;
     let mut ended: Option<DateTime<Utc>> = None;
-    let mut project = None;
+    let mut raw_cwd = None;
+    let mut tool_cwd = None;
+    let mut raw_paths = Vec::new();
     // Stream the complete source for provenance, including middle tool steps
     // outside a conversation window. Pending input is reduced to bounded edits.
     crate::util::for_each_line(path, |line| {
@@ -517,12 +558,8 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
             started = Some(started.map_or(t, |s| s.min(t)));
             ended = Some(ended.map_or(t, |s| s.max(t)));
         }
-        if let Some(cwd) = v
-            .get("cwd")
-            .or_else(|| v.get("workspace"))
-            .and_then(Value::as_str)
-        {
-            project = Some(cwd.to_owned());
+        if let Some(cwd) = workspace_cwd(&v) {
+            raw_cwd = Some(cwd);
         }
         match kind(&v) {
             "USER_INPUT" => {
@@ -532,8 +569,8 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
                 if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
                     for (i, tc) in calls.iter().enumerate() {
                         let input = args(tc);
-                        if project.is_none() {
-                            project = input
+                        if tool_cwd.is_none() {
+                            tool_cwd = input
                                 .get("Cwd")
                                 .or_else(|| input.get("cwd"))
                                 .and_then(Value::as_str)
@@ -560,7 +597,11 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
                     {
                         if let Some(mut edit) = call.edit {
                             edit.ts = ts.or(edit.ts);
-                            edits.push(edit);
+                            raw_paths.push(edit.path.clone());
+                            if let Some(path) = clean_path(&edit.path) {
+                                edit.path = path;
+                                edits.push(edit);
+                            }
                         }
                     }
                     if let Some(step) = record_id(&v).filter(|step| wanted.contains(step)) {
@@ -591,6 +632,7 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
                         },
                         text: crate::redact::redact(text).into_owned(),
                         ts,
+                        is_thought: false,
                         tool: None,
                     });
                 }
@@ -639,12 +681,18 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
         id: short_id(key),
         tool: "antigravity",
         path: PathBuf::from(key),
-        project: project.unwrap_or_else(|| "antigravity".into()),
+        project: raw_cwd
+            .clone()
+            .or(tool_cwd)
+            .unwrap_or_else(|| "antigravity".into()),
         started,
         ended,
         title: title_from_messages(&messages),
         subagent: false,
         messages,
+        raw_cwd,
+        operational_edited_paths: super::dedup_raw_paths(raw_paths),
+        compacted_prefix: false,
         touched: dedup_paths(edits.iter().map(|e| e.path.clone()).collect()),
         edits,
     })

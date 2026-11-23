@@ -18,20 +18,20 @@ pub(super) fn parse_sql(
     sid: &str,
     key: &str,
 ) -> Result<Session> {
-    let (project, raw_title, created, updated): (String, String, Option<i64>, Option<i64>) = conn
-        .query_row(
-        "SELECT directory, title, time_created, time_updated
+    let (raw_cwd, raw_title, created, updated): (Option<String>, String, Option<i64>, Option<i64>) =
+        conn.query_row(
+            "SELECT directory, title, time_created, time_updated
              FROM session WHERE id = ?1",
-        params![sid],
-        |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                r.get(2)?,
-                r.get(3)?,
-            ))
-        },
-    )?;
+            params![sid],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get(2)?,
+                    r.get(3)?,
+                ))
+            },
+        )?;
     // parent_id is fetched separately and tolerantly: an older or partial
     // schema without the column degrades to "not a subagent" rather than
     // failing the whole session.
@@ -122,12 +122,15 @@ pub(super) fn parse_sql(
         id: short_id(key),
         tool,
         path: PathBuf::from(display_path(key)),
-        project,
+        project: raw_cwd.clone().unwrap_or_default(),
         started: created.and_then(DateTime::from_timestamp_millis),
         ended: updated.and_then(DateTime::from_timestamp_millis),
         title,
         subagent: parent.is_some_and(|p| !p.is_empty()),
         messages,
+        raw_cwd,
+        operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
+        compacted_prefix: false,
         touched: dedup_paths(touched),
         edits: Vec::new(),
     })
@@ -143,11 +146,10 @@ pub(super) fn parse_json(tool: &'static str, path: &Path) -> Result<Session> {
         .and_then(Value::as_str)
         .map(String::from)
         .unwrap_or_else(|| stem(path));
-    let project = s
+    let raw_cwd = s
         .get("directory")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .map(str::to_owned);
     let started = s.pointer("/time/created").and_then(epoch_ms);
     let ended = s.pointer("/time/updated").and_then(epoch_ms);
     let subagent = s.get("parentID").is_some();
@@ -222,12 +224,15 @@ pub(super) fn parse_json(tool: &'static str, path: &Path) -> Result<Session> {
         id: short_id(&path.to_string_lossy()),
         tool,
         path: path.to_path_buf(),
-        project,
+        project: raw_cwd.clone().unwrap_or_default(),
         started,
         ended,
         title,
         subagent,
         messages,
+        raw_cwd,
+        operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
+        compacted_prefix: false,
         touched: dedup_paths(touched),
         edits: Vec::new(),
     })

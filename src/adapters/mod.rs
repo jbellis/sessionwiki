@@ -90,6 +90,10 @@ pub(crate) fn ok_or_flag<T, E>(r: std::result::Result<T, E>, had_error: &mut boo
 }
 
 pub trait Adapter {
+    /// Literal harness identity, when it can be resolved from the key or source.
+    fn native_id(&self, _key: &str) -> Option<String> {
+        None
+    }
     fn name(&self) -> &'static str;
     /// Store root, e.g. ~/.claude/projects. May not exist on this machine.
     fn root(&self) -> Option<PathBuf>;
@@ -354,4 +358,58 @@ pub(crate) fn dedup_paths(paths: Vec<String>) -> Vec<String> {
         .filter_map(|p| clean_path(&p))
         .filter(|p| seen.insert(p.clone()))
         .collect()
+}
+
+/// Dedupe native paths by literal spelling, preserving encounter order.
+pub(crate) fn dedup_raw_paths(mut paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths
+}
+
+pub(crate) fn nonblank(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().filter(|text| !text.trim().is_empty())
+}
+
+pub(crate) fn filename_stem(path: &Path) -> Option<String> {
+    Some(path.file_stem()?.to_str()?.to_owned())
+}
+
+pub(crate) fn directory_name(path: &Path) -> Option<String> {
+    Some(path.file_name()?.to_str()?.to_owned())
+}
+
+pub(crate) fn json_file_id(path: &Path) -> Option<String> {
+    let value: Option<serde_json::Value> = crate::util::read_to_string_capped(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    value
+        .as_ref()
+        .and_then(|v| nonblank(&v["id"]))
+        .map(str::to_owned)
+        .or_else(|| filename_stem(path))
+}
+
+/// Enumerate regular JSONL files in a deterministic order, without following symlinks.
+pub(crate) fn nested_jsonl(root: &Path) -> Result<Vec<PathBuf>> {
+    match root.symlink_metadata() {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_root_links(false)
+        .sort_by_file_name()
+        .min_depth(1)
+    {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "jsonl")
+        {
+            files.push(entry.into_path());
+        }
+    }
+    Ok(files)
 }

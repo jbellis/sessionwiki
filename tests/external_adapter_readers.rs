@@ -47,8 +47,12 @@ impl Adapter for OneFileAdapter {
                 role: Role::User,
                 text: fs::read_to_string(path)?,
                 ts: None,
+                is_thought: false,
                 tool: None,
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec![],
             edits: vec![],
         })
@@ -178,6 +182,7 @@ impl Adapter for ToolOutputAdapter {
                 role: Role::Tool,
                 text: "→ shell(cargo test) ⇒ ok · 2 lines".into(),
                 ts: None,
+                is_thought: false,
                 tool: Some(ToolEvent::Summary(ToolSummary {
                     name: "shell".into(),
                     args: serde_json::json!({"command": "cargo test"}),
@@ -186,6 +191,9 @@ impl Adapter for ToolOutputAdapter {
                     lines: Some(2),
                 })),
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: Vec::new(),
             edits: Vec::new(),
         })

@@ -60,6 +60,20 @@ impl Dsh {
 }
 
 impl Adapter for Dsh {
+    fn native_id(&self, key: &str) -> Option<String> {
+        let path = Path::new(key);
+        let native_layout = path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "sessions");
+        if path.extension().is_some_and(|ext| ext == "json") && !native_layout && !path.is_dir() {
+            crate::adapters::json_file_id(path)
+        } else {
+            native::native_id(key)
+        }
+    }
+
     fn name(&self) -> &'static str {
         "dsh"
     }
@@ -181,6 +195,7 @@ fn parse_acp(path: &Path) -> Result<Session> {
         .and_then(parse_ts);
     let mut messages = Vec::new();
     let mut touched = Vec::new();
+    let mut raw_paths = Vec::new();
     for message in record["messages"].as_array().into_iter().flatten() {
         let role = match message.get("role").and_then(Value::as_str) {
             Some("user") => Role::User,
@@ -210,6 +225,7 @@ fn parse_acp(path: &Path) -> Result<Session> {
                 role,
                 text: crate::redact::redact(&text).into_owned(),
                 ts: None,
+                is_thought: false,
                 tool: None,
             });
         }
@@ -233,6 +249,11 @@ fn parse_acp(path: &Path) -> Result<Session> {
             let args: Value = serde_json::from_str(&redacted)
                 .unwrap_or_else(|_| Value::String(redacted.into_owned()));
             if matches!(name, "write_file" | "edit_file") {
+                if let Ok(value) = serde_json::from_str::<Value>(raw) {
+                    if let Some(path) = value["path"].as_str() {
+                        raw_paths.push(path.to_owned());
+                    }
+                }
                 if let Some(path) = args.get("path").and_then(Value::as_str) {
                     touched.push(path.to_owned());
                 }
@@ -270,6 +291,9 @@ fn parse_acp(path: &Path) -> Result<Session> {
             .and_then(Value::as_str)
             .is_some_and(|id| !id.is_empty()),
         messages,
+        raw_cwd: record.get("cwd").and_then(Value::as_str).map(str::to_owned),
+        operational_edited_paths: crate::adapters::dedup_raw_paths(raw_paths),
+        compacted_prefix: false,
         touched: dedup_paths(touched),
         edits: Vec::new(),
     })

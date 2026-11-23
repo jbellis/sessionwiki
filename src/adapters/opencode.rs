@@ -34,6 +34,13 @@ pub struct OpenCode {
 }
 
 impl Adapter for OpenCode {
+    fn native_id(&self, key: &str) -> Option<String> {
+        if let Some((_, id)) = key.split_once(KEY_SEP) {
+            return (!id.is_empty()).then(|| id.to_owned());
+        }
+        crate::adapters::json_file_id(Path::new(key))
+    }
+
     fn name(&self) -> &'static str {
         "opencode"
     }
@@ -397,6 +404,7 @@ fn push(messages: &mut Vec<Message>, role: Role, text: &str, ts: Option<DateTime
             role,
             text: text.to_string(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }

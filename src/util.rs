@@ -36,7 +36,10 @@ pub fn session_lines_keeping(
     keep: impl Fn(&str) -> bool,
 ) -> Result<(Vec<String>, bool)> {
     let (cap, head, tail) = window_limits();
-    lines_keeping(path, cap, head, tail, MIDDLE_KEPT_BYTES, keep)
+    let middle = MIDDLE_KEPT_BYTES;
+    #[cfg(test)]
+    let middle = TEST_MIDDLE_BYTES.with(|w| w.get()).unwrap_or(middle);
+    lines_keeping(path, cap, head, tail, middle, keep)
 }
 
 fn lines_keeping(
@@ -110,6 +113,8 @@ fn lines_keeping(
 thread_local! {
     /// Lets an adapter test window a small file: (cap, head, tail) bytes.
     pub(crate) static TEST_WINDOW: std::cell::Cell<Option<(u64, u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static TEST_MIDDLE_BYTES: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -226,14 +231,7 @@ fn window_lines(head: &[u8], tail: &[u8]) -> Vec<String> {
 /// Every line of a session file, plain or zstd, one at a time - for reading a
 /// file past the byte cap end to end without holding it in memory.
 pub fn for_each_line(path: &Path, mut f: impl FnMut(&str)) -> Result<()> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut reader: Box<dyn BufRead> = if is_zstd(path) {
-        let decoder = ZstdFrames::new(BufReader::new(file));
-        Box::new(BufReader::new(decoder))
-    } else {
-        Box::new(BufReader::new(file))
-    };
+    let mut reader = line_reader(path)?;
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -241,6 +239,38 @@ pub fn for_each_line(path: &Path, mut f: impl FnMut(&str)) -> Result<()> {
             return Ok(());
         }
         f(&String::from_utf8_lossy(&line));
+    }
+}
+
+pub(crate) fn line_reader(path: &Path) -> Result<Box<dyn std::io::BufRead>> {
+    use std::io::BufReader;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    if is_zstd(path) {
+        let decoder = ZstdFrames::new(BufReader::new(file));
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+/// Inspect complete JSONL records within a bounded decoded header.
+pub(crate) fn find_in_jsonl_header<T>(
+    path: &Path,
+    mut find: impl FnMut(&serde_json::Value) -> Option<T>,
+) -> Option<T> {
+    use std::io::{BufRead, Read};
+    let mut reader = line_reader(path).ok()?.take(256 * 1024);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            return None;
+        }
+        if let Ok(value) = serde_json::from_slice(&line) {
+            if let Some(found) = find(&value) {
+                return Some(found);
+            }
+        }
     }
 }
 

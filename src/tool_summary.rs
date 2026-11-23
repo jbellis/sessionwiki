@@ -441,6 +441,9 @@ mod tests {
             title: "test".into(),
             subagent: false,
             messages,
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec![],
             edits: vec![],
         }
@@ -715,6 +718,7 @@ mod tests {
             role: crate::model::Role::User,
             text: "hello".into(),
             ts: None,
+            is_thought: false,
             tool: None,
         };
         let value = serde_json::to_value(plain).unwrap();

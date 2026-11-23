@@ -42,6 +42,9 @@ pub struct Message {
     pub ts: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<ToolEvent>,
+    /// True for assistant reasoning summaries.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_thought: bool,
 }
 
 /// Structured tool data before or after the shared summary pass.
@@ -89,6 +92,7 @@ impl Message {
             role: Role::Tool,
             text: String::new(),
             ts,
+            is_thought: false,
             tool: Some(ToolEvent::Part(ToolPart::Call(call))),
         }
     }
@@ -98,6 +102,7 @@ impl Message {
             role: Role::Tool,
             text: String::new(),
             ts,
+            is_thought: false,
             tool: Some(ToolEvent::Part(ToolPart::Result(result))),
         }
     }
@@ -145,6 +150,15 @@ pub struct Session {
     pub tool: &'static str,
     pub path: PathBuf,
     pub project: String,
+    /// Literal native working directory, available when parsing the source.
+    #[serde(skip_serializing)]
+    pub raw_cwd: Option<String>,
+    /// Literal paths backed by the adapter’s native write evidence.
+    #[serde(skip_serializing)]
+    pub operational_edited_paths: Vec<String>,
+    /// The source begins with compacted history before its first real prompt.
+    #[serde(skip_serializing)]
+    pub compacted_prefix: bool,
     pub started: Option<DateTime<Utc>>,
     pub ended: Option<DateTime<Utc>>,
     pub title: String,

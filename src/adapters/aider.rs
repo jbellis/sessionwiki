@@ -72,6 +72,7 @@ fn flush(messages: &mut Vec<Message>, role: Option<Role>, buf: &mut Vec<String>)
                 role,
                 text,
                 ts: None,
+                is_thought: false,
                 tool: None,
             });
         }
@@ -286,6 +287,9 @@ fn session_from_run(path: &Path, idx: usize, run: &Run) -> Result<Session> {
         title: title_from(&messages),
         subagent: false,
         messages,
+        raw_cwd: None,
+        operational_edited_paths: Vec::new(),
+        compacted_prefix: false,
         touched,
         edits: Vec::new(),
     })

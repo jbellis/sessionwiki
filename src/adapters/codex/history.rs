@@ -180,6 +180,11 @@ thread_local! {
 }
 
 impl Adapter for CodexHistory {
+    fn native_id(&self, key: &str) -> Option<String> {
+        let (_, id) = key.split_once(KEY_SEP)?;
+        (!id.is_empty()).then(|| id.to_owned())
+    }
+
     fn name(&self) -> &'static str {
         "codex"
     }
@@ -250,7 +255,10 @@ impl Adapter for CodexHistory {
                 ended = ts;
             }
             if first_cwd.is_none() {
-                first_cwd = item.get("cwd").and_then(Value::as_str).map(str::to_owned);
+                first_cwd = item
+                    .get("cwd")
+                    .and_then(crate::adapters::nonblank)
+                    .map(str::to_owned);
             }
             read_item(&item, ts, &mut messages, &mut touched);
         }
@@ -261,16 +269,20 @@ impl Adapter for CodexHistory {
         let (cwd, subagent) = registry
             .and_then(|state| thread_registry(&state, thread))
             .unwrap_or((None, false));
+        let raw_cwd = cwd.or(first_cwd);
         Ok(Session {
             id: short_id(key),
             tool: self.name(),
             path: PathBuf::from(key),
-            project: cwd.or(first_cwd).unwrap_or_default(),
+            project: raw_cwd.clone().unwrap_or_default(),
             started,
             ended,
             title: title_from_messages(&messages),
             subagent,
             messages,
+            raw_cwd,
+            operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
+            compacted_prefix: false,
             touched: dedup_paths(touched),
             edits: Vec::new(),
         })
@@ -300,7 +312,7 @@ fn thread_registry(state: &Path, thread: &str) -> Option<(Option<String>, bool)>
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .is_some_and(|s| s.get("subagent").is_some());
     Some((
-        cwd.filter(|c| !c.is_empty()),
+        cwd.filter(|c| !c.trim().is_empty()),
         by_source || by_thread.as_deref() == Some("subagent"),
     ))
 }

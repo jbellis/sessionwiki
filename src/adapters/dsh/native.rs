@@ -182,6 +182,78 @@ pub(super) fn modified_at(key: &str) -> Option<DateTime<Utc>> {
     Some(regular_file(&selected.path).ok()?.modified().ok()?.into())
 }
 
+pub(super) fn native_id(key: &str) -> Option<String> {
+    let dir = Path::new(key);
+    let encoded = dir.file_name()?.to_str()?;
+    let id = read_native_id(key).or_else(|| decode_segment(encoded))?;
+    Some(id)
+}
+
+fn read_native_id(key: &str) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let dir = checked_directory(key).ok()?;
+    let generation = select_generation(dir).ok()??;
+    if generation.version > CURRENT_VERSION {
+        return None;
+    }
+    let mut reader = crate::util::line_reader(&generation.path)
+        .ok()?
+        .take(256 * 1024);
+    let mut line = String::new();
+    loop {
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        if !line.trim().is_empty() {
+            let header: Value = serde_json::from_str(&line).ok()?;
+            return validate_header(&header, generation.version, dir)
+                .ok()
+                .map(str::to_owned);
+        }
+        line.clear();
+    }
+}
+
+fn decode_segment(encoded: &str) -> Option<String> {
+    let mut units = Vec::new();
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'~' {
+            let mut unit = 0;
+            for _ in 0..4 {
+                unit = unit * 16 + char::from(bytes.next()?).to_digit(16)? as u16;
+            }
+            units.push(unit);
+        } else {
+            units.push(u16::from(byte));
+        }
+    }
+    let decoded = String::from_utf16(&units).ok()?;
+    (!decoded.is_empty() && encode_segment(&decoded) == encoded).then_some(decoded)
+}
+
+fn validate_header<'a>(header: &'a Value, version: u64, dir: &Path) -> Result<&'a str> {
+    ensure!(
+        header["type"] == "session"
+            && header["version"].as_u64() == Some(version)
+            && header["id"].as_str().is_some_and(|id| !id.is_empty())
+            && timestamp(&header["createdAt"]).is_some()
+            && header["delegationDepth"].as_u64().is_some()
+            && header.get("origin").is_none_or(|v| v == "subagent")
+            && ["parentSession", "agentPreset"]
+                .iter()
+                .all(|field| { header.get(field).is_none_or(Value::is_string) })
+            && (version < 2 || header["isSeeded"].is_boolean()),
+        "invalid native session header"
+    );
+    let id = header["id"].as_str().unwrap_or_default();
+    ensure!(
+        dir.file_name().and_then(|n| n.to_str()) == Some(encode_segment(id).as_str()),
+        "native session header id does not match its directory"
+    );
+    Ok(id)
+}
+
 pub(super) fn parse(key: &str) -> Result<Session> {
     let dir = checked_directory(key)?;
     let selected = select_generation(dir)?.context("native session has no committed generation")?;
@@ -194,24 +266,7 @@ pub(super) fn parse(key: &str) -> Result<Session> {
     let mut rows = lines.iter().filter(|line| !line.trim().is_empty());
     let header: Value = serde_json::from_str(rows.next().context("native session has no header")?)
         .context("invalid native session header")?;
-    ensure!(
-        header["type"] == "session"
-            && header["version"].as_u64() == Some(selected.version)
-            && header["id"].as_str().is_some_and(|id| !id.is_empty())
-            && timestamp(&header["createdAt"]).is_some()
-            && header["delegationDepth"].as_u64().is_some()
-            && header.get("origin").is_none_or(|v| v == "subagent")
-            && ["parentSession", "agentPreset"]
-                .iter()
-                .all(|field| { header.get(field).is_none_or(Value::is_string) })
-            && (selected.version < 2 || header["isSeeded"].is_boolean()),
-        "invalid native session header"
-    );
-    let id = header["id"].as_str().unwrap_or_default();
-    ensure!(
-        dir.file_name().and_then(|n| n.to_str()) == Some(encode_segment(id).as_str()),
-        "native session header id does not match its directory"
-    );
+    validate_header(&header, selected.version, dir)?;
     let project = match header.get("cwd") {
         Some(Value::String(cwd)) => crate::redact::redact(cwd).into_owned(),
         None => String::new(),
@@ -321,7 +376,7 @@ pub(super) fn parse(key: &str) -> Result<Session> {
         }
     }
 
-    let edits: Vec<_> = if windowed {
+    let mut edits: Vec<_> = if windowed {
         // The bounded conversation window omits most tool calls and results.
         // Recover provenance one row at a time, retaining only edit evidence.
         complete_edits(&selected.path)?
@@ -338,6 +393,17 @@ pub(super) fn parse(key: &str) -> Result<Session> {
             && change_token(&after.path, &regular_file(&after.path)?)? == before,
         "native session changed while reading; retry on the next sync"
     );
+    let operational_edited_paths =
+        super::super::dedup_raw_paths(edits.iter().map(|edit| edit.path.clone()).collect());
+    edits.retain_mut(|edit| {
+        let redacted = crate::redact::redact(&edit.path);
+        if let Some(path) = clean_path(&redacted) {
+            edit.path = path;
+            true
+        } else {
+            false
+        }
+    });
     let touched = dedup_paths(edits.iter().map(|edit| edit.path.clone()).collect());
     let title = title
         .or(human_title)
@@ -356,6 +422,9 @@ pub(super) fn parse(key: &str) -> Result<Session> {
         },
         subagent,
         messages,
+        raw_cwd: header["cwd"].as_str().map(str::to_owned),
+        operational_edited_paths,
+        compacted_prefix: false,
         touched,
         edits,
     })
@@ -391,8 +460,7 @@ fn complete_edits(path: &Path) -> Result<Vec<EditEvent>> {
                     if matches!(name, "write" | "edit" | "str_replace_editor")
                         && !calls.contains(id)
                     {
-                        let mut args = arguments(data);
-                        redact_values(&mut args);
+                        let args = arguments(data);
                         if let Some(edit) = edit_event(name, &args, timestamp(&row["time"])) {
                             calls.insert(id.to_owned());
                             edits.push((id.to_owned(), edit));
@@ -468,6 +536,7 @@ fn push_text(messages: &mut Vec<Message>, role: Role, content: &Value, ts: Optio
             role,
             text: crate::redact::redact(&text).into_owned(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }
@@ -488,10 +557,10 @@ fn add_call(
         return;
     }
     let mut args = arguments(data);
-    redact_values(&mut args);
     if let Some(edit) = edit_event(name, &args, ts) {
         edits.push((id.to_owned(), edit));
     }
+    redact_values(&mut args);
     messages.push(Message::tool_call(
         ts,
         ToolCall {
@@ -561,11 +630,10 @@ fn edit_event(name: &str, args: &Value, ts: Option<DateTime<Utc>>) -> Option<Edi
         },
         _ => return None,
     };
-    let path = clean_path(
-        args["file_path"]
-            .as_str()
-            .or_else(|| args["path"].as_str())?,
-    )?;
+    let path = args["file_path"]
+        .as_str()
+        .or_else(|| args["path"].as_str())?
+        .to_owned();
     Some(EditEvent {
         path,
         kind,

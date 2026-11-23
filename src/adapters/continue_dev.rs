@@ -207,6 +207,9 @@ fn parse_session(tool: &'static str, path: &Path) -> Result<Session> {
         title,
         subagent: false,
         messages,
+        raw_cwd: None,
+        operational_edited_paths: Vec::new(),
+        compacted_prefix: false,
         touched: dedup_paths(touched),
         edits: Vec::new(),
     })
@@ -389,6 +392,7 @@ fn push(messages: &mut Vec<Message>, role: Role, text: &str) {
             role,
             text: text.to_string(),
             ts: None,
+            is_thought: false,
             tool: None,
         });
     }

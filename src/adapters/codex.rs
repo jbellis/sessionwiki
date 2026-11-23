@@ -2,11 +2,12 @@ use super::{
     bounded_redacted_output, dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter,
     Discovered,
 };
-use crate::model::{Message, Role, Session, ToolCall, ToolResult};
+use crate::model::{EditEvent, EditKind, Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -70,28 +71,103 @@ impl Codex {
     }
 }
 
-/// A rollout line that is conversation, for keeping from a windowed file.
-///
-/// Read from the record's own tags, not from anywhere in the line: Codex
-/// writes the record type first and the payload's type next, while a
-/// `compacted` record or a tool's output can contain the same words further in.
-fn conversation_line(line: &str) -> bool {
-    let mut tags = line.match_indices("\"type\":\"").map(|(at, tag)| {
-        let rest = &line[at + tag.len()..];
-        &rest[..rest.find('"').unwrap_or(0)]
-    });
-    match tags.next() {
-        // Older rollouts wrote a message at the top level.
-        Some("message") => true,
-        Some("response_item" | "event_msg") => matches!(
-            tags.next(),
-            Some("message" | "user_message" | "agent_message")
-        ),
-        _ => false,
+// Deserialize just the routing tags. Unknown fields (including tool payloads
+// and compaction history) are skipped without materializing them as Values.
+#[derive(Deserialize)]
+struct Routing {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Option<PayloadRouting>,
+}
+
+#[derive(Deserialize)]
+struct PayloadRouting {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    item: Option<ItemRouting>,
+    call_id: Option<String>,
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ItemRouting {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    status: Option<String>,
+}
+
+impl Routing {
+    fn tags(&self) -> (&str, Option<&str>, Option<&str>) {
+        let payload = self.payload.as_ref();
+        (
+            &self.kind,
+            payload.and_then(|p| p.kind.as_deref()),
+            payload
+                .and_then(|p| p.item.as_ref())
+                .and_then(|i| i.kind.as_deref()),
+        )
     }
 }
 
+fn conversation_line(line: &str) -> bool {
+    let Ok(route) = serde_json::from_str::<Routing>(line) else {
+        return false;
+    };
+    matches!(
+        route.tags(),
+        ("message", _, _)
+            | ("response_item", Some("message"), _)
+            | (
+                "event_msg",
+                Some(
+                    "user_message"
+                        | "agent_message"
+                        | "task_started"
+                        | "turn_started"
+                        | "task_complete"
+                        | "turn_complete"
+                        | "turn_aborted"
+                ),
+                _
+            )
+            | (
+                "event_msg",
+                Some("item_completed"),
+                Some("UserMessage" | "AgentMessage" | "ContextCompaction")
+            )
+    )
+}
+
+fn rollout_suffix(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    let rollout = stem.strip_prefix("rollout-")?;
+    let (prefix, id) = rollout.split_at_checked(rollout.len().checked_sub(36)?)?;
+    (prefix.ends_with('-')
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        }))
+    .then(|| id.to_owned())
+}
+
 impl Adapter for Codex {
+    fn native_id(&self, key: &str) -> Option<String> {
+        let path = Path::new(key);
+        crate::util::find_in_jsonl_header(path, |v| {
+            if v["type"] != "session_meta" {
+                return None;
+            }
+            super::nonblank(&v["payload"]["id"]).map(str::to_owned)
+        })
+        .or_else(|| rollout_suffix(path))
+    }
+
     fn name(&self) -> &'static str {
         "codex"
     }
@@ -137,22 +213,14 @@ impl Adapter for Codex {
         let (lines, windowed) = crate::util::session_lines_keeping(path, conversation_line)?;
 
         let mut messages: Vec<Message> = Vec::new();
-        let mut patches = Patches::default();
-        let mut cwd: Option<String> = None;
-        // Sub-agent threads say so in session_meta; their task arrives encrypted.
-        let mut subagent = false;
+        let mut evidence = RolloutEvidence::default();
+        let mut mirrors = DialogueMirrors::default();
         // An MCP call's failure is stated only in its `mcp_tool_call_end` event;
         // the `function_call_output` carries the text alone.
         let mut failed_mcp_calls: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut started = None;
         let mut ended = None;
-        // Current rollouts carry each user prompt TWICE (event_msg AND
-        // response_item). Counted multisets cancel each pair exactly once, so
-        // a genuinely repeated prompt ("continue" twice) still indexes twice.
-        let mut response_user_texts: HashMap<String, u32> = HashMap::new();
-        let mut event_user_texts: HashMap<String, u32> = HashMap::new();
-
         // Some rollouts record an MCP call only as its end event. Those are
         // indexed from the event, unless a `function_call` already stands for
         // the same call - by id, or by identical arguments under another id.
@@ -174,50 +242,38 @@ impl Adapter for Codex {
                 ended = Some(t);
             }
 
-            match v.get("type").and_then(Value::as_str) {
-                Some("session_meta") => {
-                    subagent |= is_subagent_meta(&v);
-                    if cwd.is_none() {
-                        cwd = v
-                            .pointer("/payload/cwd")
-                            .and_then(Value::as_str)
-                            .map(String::from);
-                    }
+            let dialogue = Dialogue::from_record(&v);
+            if !windowed {
+                evidence.observe(&v, dialogue.as_ref());
+                if v["type"] == "event_msg"
+                    && v["payload"]["type"] == "item_completed"
+                    && v["payload"]["item"]["type"] == "FileChange"
+                {
+                    evidence.file_change(line, v["payload"]["item"]["status"].as_str(), ts);
                 }
+            }
+            if v["type"] == "event_msg" {
+                match v["payload"]["type"].as_str() {
+                    Some("task_started" | "turn_started") => {
+                        mirrors.begin(v["payload"]["turn_id"].as_str().unwrap_or_default());
+                    }
+                    Some("task_complete" | "turn_complete" | "turn_aborted") => mirrors.begin(""),
+                    _ => {}
+                }
+            }
+            if let Some(dialogue) = dialogue {
+                if mirrors.first_occurrence(&v, &dialogue) {
+                    push(&mut messages, dialogue.role, &dialogue.text, ts);
+                }
+                continue;
+            }
+
+            match v["type"].as_str() {
                 Some("response_item") => {
                     match v.pointer("/payload/type").and_then(Value::as_str) {
-                        Some("message") => {
-                            let role = match v.pointer("/payload/role").and_then(Value::as_str) {
-                                Some("user") => Role::User,
-                                Some("assistant") => Role::Assistant,
-                                _ => continue,
-                            };
-                            let Some(Value::Array(blocks)) = v.pointer("/payload/content") else {
-                                continue;
-                            };
-                            for b in blocks {
-                                let Some(text) = b.get("text").and_then(Value::as_str) else {
-                                    continue;
-                                };
-                                if role == Role::User && is_boilerplate(text) {
-                                    continue;
-                                }
-                                if role == Role::User {
-                                    if let Some(n) =
-                                        event_user_texts.get_mut(text).filter(|n| **n > 0)
-                                    {
-                                        *n -= 1; // pairs with an already-pushed event_msg
-                                        continue;
-                                    }
-                                    *response_user_texts.entry(text.to_string()).or_insert(0) += 1;
-                                }
-                                push(&mut messages, role, text, ts);
-                            }
-                        }
                         Some("function_call") => {
                             let payload = v.get("payload").unwrap_or(&Value::Null);
                             let raw_args = payload.get("arguments").and_then(Value::as_str);
-                            patches.call(payload);
                             let mut args = if let Some(raw_args) = raw_args {
                                 serde_json::from_str(raw_args)
                                     .unwrap_or_else(|_| json!({"arguments": raw_args}))
@@ -248,7 +304,6 @@ impl Adapter for Codex {
                                     .map(|(_, patch)| format!("*** Begin Patch{patch}"))
                                     .unwrap_or_else(|| input.to_owned())
                                     .replace("\\n", "\n");
-                                patches.call(payload);
                                 ("apply_patch", json!({"patch": patch}))
                             } else if let Some(cmd) = exec_command_cmd(input) {
                                 // The `exec` tool runs a JS snippet; the common shape is
@@ -282,7 +337,6 @@ impl Adapter for Codex {
                                 .get("output")
                                 .map(unwrap_output_value)
                                 .unwrap_or_default();
-                            patches.result(payload, &output, is_error);
                             messages.push(Message::tool_result(
                                 ts,
                                 ToolResult {
@@ -297,125 +351,55 @@ impl Adapter for Codex {
                         _ => {}
                     }
                 }
-                Some("event_msg") => match v.pointer("/payload/type").and_then(Value::as_str) {
-                    Some("user_message") => {
-                        if let Some(t) = v.pointer("/payload/message").and_then(Value::as_str) {
-                            if !is_boilerplate(t) {
-                                if let Some(n) = response_user_texts.get_mut(t).filter(|n| **n > 0)
-                                {
-                                    *n -= 1; // pairs with an already-pushed response_item
-                                } else {
-                                    *event_user_texts.entry(t.to_string()).or_insert(0) += 1;
-                                    push(&mut messages, Role::User, t, ts);
-                                }
-                            }
-                        }
+                Some("event_msg") if v["payload"]["type"] == "mcp_tool_call_end" => {
+                    let result = v.pointer("/payload/result");
+                    let failed = result.is_some_and(|r| {
+                        r.get("Err").is_some()
+                            || r.pointer("/Ok/isError").and_then(Value::as_bool) == Some(true)
+                    });
+                    let id = v.pointer("/payload/call_id").and_then(Value::as_str);
+                    if let (true, Some(id)) = (failed, id) {
+                        failed_mcp_calls.insert(id.to_owned());
                     }
-                    Some("agent_message") => {
-                        if let Some(t) = v.pointer("/payload/message").and_then(Value::as_str) {
-                            push(&mut messages, Role::Assistant, t, ts);
-                        }
-                    }
-                    Some("mcp_tool_call_end") => {
-                        let result = v.pointer("/payload/result");
-                        let failed = result.is_some_and(|r| {
-                            r.get("Err").is_some()
-                                || r.pointer("/Ok/isError").and_then(Value::as_bool) == Some(true)
-                        });
-                        let id = v.pointer("/payload/call_id").and_then(Value::as_str);
-                        if let (true, Some(id)) = (failed, id) {
-                            failed_mcp_calls.insert(id.to_owned());
-                        }
-                        let mut args = v
-                            .pointer("/payload/invocation/arguments")
-                            .cloned()
-                            .unwrap_or_else(|| json!({}));
-                        let paired = id.is_some_and(|id| function_call_ids.contains(id))
-                            || function_call_args.contains(&args);
-                        if !paired {
-                            redact_json_strings(&mut args);
-                            let name = v
-                                .pointer("/payload/invocation/tool")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?")
-                                .to_owned();
-                            messages.push(Message::tool_call(
-                                ts,
-                                ToolCall {
-                                    id: id.map(str::to_owned),
-                                    name,
-                                    args,
-                                },
-                            ));
-                            messages.push(Message::tool_result(
-                                ts,
-                                ToolResult {
-                                    call_id: id.map(str::to_owned),
-                                    text: bounded_redacted_output(&mcp_result_text(result)),
-                                    is_error: failed,
-                                },
-                            ));
-                        }
-                    }
-                    _ => {}
-                },
-                Some("message") => {
-                    let role = match v.get("role").and_then(Value::as_str) {
-                        Some("user") => Role::User,
-                        Some("assistant") => Role::Assistant,
-                        _ => continue,
-                    };
-                    let Some(Value::Array(blocks)) = v.get("content") else {
-                        continue;
-                    };
-                    for b in blocks {
-                        let Some(text) = b.get("text").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        if role == Role::User && is_boilerplate(text) {
-                            continue;
-                        }
-                        push(&mut messages, role, text, ts);
+                    let mut args = v
+                        .pointer("/payload/invocation/arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let paired = id.is_some_and(|id| function_call_ids.contains(id))
+                        || function_call_args.contains(&args);
+                    if !paired {
+                        redact_json_strings(&mut args);
+                        let name = v
+                            .pointer("/payload/invocation/tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_owned();
+                        messages.push(Message::tool_call(
+                            ts,
+                            ToolCall {
+                                id: id.map(str::to_owned),
+                                name,
+                                args,
+                            },
+                        ));
+                        messages.push(Message::tool_result(
+                            ts,
+                            ToolResult {
+                                call_id: id.map(str::to_owned),
+                                text: bounded_redacted_output(&mcp_result_text(result)),
+                                is_error: failed,
+                            },
+                        ));
                     }
                 }
                 _ => {}
             }
         }
 
-        // The window drops the middle of the file, and with it the files the
-        // rollout patched there. Those are read from the whole file: only lines
-        // that carry a patch marker or a patch failure are parsed.
         if windowed {
-            let mut all = Patches::default();
-            let read = crate::util::for_each_line(path, |line| {
-                if !line.contains("*** ") && !Patches::may_report_failure(line) {
-                    return;
-                }
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    return;
-                };
-                if v.get("type").and_then(Value::as_str) != Some("response_item") {
-                    return;
-                }
-                let payload = v.get("payload").unwrap_or(&Value::Null);
-                match payload.get("type").and_then(Value::as_str) {
-                    Some("function_call" | "custom_tool_call") => all.call(payload),
-                    Some("function_call_output" | "custom_tool_call_output") => {
-                        let (output, is_error) = payload
-                            .get("output")
-                            .map(unwrap_output_value)
-                            .unwrap_or_default();
-                        all.result(payload, &output, is_error);
-                    }
-                    _ => {}
-                }
-            });
-            if read.is_ok() {
-                patches = all;
-            }
+            crate::util::for_each_line(path, |line| evidence.scan_line(line))?;
         }
 
-        let project = cwd.unwrap_or_default();
         for message in &mut messages {
             if let Some(crate::model::ToolEvent::Part(crate::model::ToolPart::Result(result))) =
                 &mut message.tool
@@ -435,19 +419,396 @@ impl Adapter for Codex {
             title_from_messages(&messages)
         };
 
+        let operational_edited_paths = evidence.operational_paths();
+        let touched = dedup_paths(
+            evidence
+                .patches
+                .applied()
+                .chain(evidence.completed_paths.iter().cloned())
+                .collect(),
+        );
+
         Ok(Session {
             id: short_id(&path.to_string_lossy()),
             tool: self.name(),
             path: path.to_path_buf(),
-            project,
+            project: evidence.cwd.clone().unwrap_or_default(),
             started,
             ended,
             title,
-            subagent,
+            subagent: evidence.subagent,
             messages,
-            touched: dedup_paths(patches.applied()),
-            edits: Vec::new(),
+            raw_cwd: evidence.cwd,
+            operational_edited_paths,
+            compacted_prefix: evidence.compacted_prefix,
+            touched,
+            edits: evidence.edits,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DialogueSource {
+    Response = 0,
+    LegacyEvent = 1,
+    Completed = 2,
+}
+
+struct Dialogue {
+    role: Role,
+    source: Option<DialogueSource>,
+    text: String,
+}
+
+impl Dialogue {
+    fn from_record(record: &Value) -> Option<Self> {
+        let payload = &record["payload"];
+        let (role, source, content) = match (record["type"].as_str(), payload["type"].as_str()) {
+            (Some("message"), _) => (dialogue_role(record)?, None, &record["content"]),
+            (Some("response_item"), Some("message")) => (
+                dialogue_role(payload)?,
+                Some(DialogueSource::Response),
+                &payload["content"],
+            ),
+            (Some("event_msg"), Some("user_message" | "agent_message")) => {
+                let role = if payload["type"] == "user_message" {
+                    Role::User
+                } else {
+                    Role::Assistant
+                };
+                (role, Some(DialogueSource::LegacyEvent), &payload["message"])
+            }
+            (Some("event_msg"), Some("item_completed")) => {
+                let item = &payload["item"];
+                let role = match item["type"].as_str()? {
+                    "UserMessage" => Role::User,
+                    "AgentMessage" => Role::Assistant,
+                    _ => return None,
+                };
+                (role, Some(DialogueSource::Completed), &item["content"])
+            }
+            _ => return None,
+        };
+        let include = |s: &str| !s.trim().is_empty() && !(role == Role::User && is_boilerplate(s));
+        let text = if source.is_some_and(|s| matches!(s, DialogueSource::LegacyEvent)) {
+            let text = content.as_str()?;
+            include(text).then(|| text.trim().to_owned())?
+        } else {
+            content
+                .as_array()?
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .filter(|text| include(text))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_owned()
+        };
+        (!text.is_empty()).then_some(Self { role, source, text })
+    }
+}
+
+fn dialogue_role(value: &Value) -> Option<Role> {
+    match value["role"].as_str()? {
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct DialogueMirrors {
+    current_id: Option<String>,
+    boundary: bool,
+    current: TurnDialogue,
+    turns: HashMap<String, TurnDialogue>,
+}
+
+impl DialogueMirrors {
+    fn begin(&mut self, turn: &str) {
+        self.current_id = (!turn.is_empty()).then(|| turn.to_owned());
+        self.boundary = self.current_id.is_some();
+        self.current = TurnDialogue::default();
+        if let Some(id) = &self.current_id {
+            self.turns.entry(id.clone()).or_default();
+        }
+    }
+
+    fn first_occurrence(&mut self, record: &Value, message: &Dialogue) -> bool {
+        let Some(source) = message.source else {
+            return true;
+        };
+        let explicit = record["payload"]["turn_id"]
+            .as_str()
+            .or_else(|| record["payload"]["item"]["turn_id"].as_str())
+            .or_else(|| record["turn_id"].as_str())
+            .filter(|id| !id.is_empty());
+        // A newly seen explicit ID can arrive after its untagged mirrors.
+        // Once known, it also lets late records resolve to their own turn.
+        if let Some(id) = explicit {
+            if !self.turns.contains_key(id) {
+                let turn = if self.current_id.is_none() {
+                    std::mem::take(&mut self.current)
+                } else {
+                    TurnDialogue::default()
+                };
+                self.turns.insert(id.to_owned(), turn);
+                if self.current_id.as_deref() != Some(id) {
+                    self.boundary = false;
+                }
+                self.current_id = Some(id.to_owned());
+            }
+            return self
+                .turns
+                .entry(id.to_owned())
+                .or_default()
+                .observe(message, source, false);
+        }
+        if let Some(id) = &self.current_id {
+            let turn = self.turns.entry(id.clone()).or_default();
+            let fresh_prompt = message.role == Role::User
+                && !turn.assistant.is_empty()
+                && turn.would_emit(message, source);
+            if self.boundary || !fresh_prompt {
+                return turn.observe(message, source, false);
+            }
+            self.current_id = None;
+        }
+        self.current.observe(message, source, true)
+    }
+}
+
+#[derive(Default)]
+struct TurnDialogue {
+    user: HashMap<String, [usize; 3]>,
+    assistant: HashMap<String, [usize; 3]>,
+}
+
+impl TurnDialogue {
+    fn would_emit(&self, dialogue: &Dialogue, source: DialogueSource) -> bool {
+        let by_text = if dialogue.role == Role::User {
+            &self.user
+        } else {
+            &self.assistant
+        };
+        by_text.get(&dialogue.text).is_none_or(|counts| {
+            counts[source as usize] == counts.iter().copied().max().unwrap_or_default()
+        })
+    }
+
+    fn observe(&mut self, dialogue: &Dialogue, source: DialogueSource, implicit: bool) -> bool {
+        let source = source as usize;
+        let by_text = if dialogue.role == Role::User {
+            &mut self.user
+        } else {
+            &mut self.assistant
+        };
+        let counts = by_text.entry(dialogue.text.clone()).or_default();
+        // The nth occurrence from a source matches the nth occurrence of
+        // this text in any other source. Emit at the first record's position.
+        let first = counts[source] == counts.iter().copied().max().unwrap_or_default();
+        counts[source] += 1;
+        // Without explicit turn markers, a new prompt after an assistant
+        // response starts a new turn. Late mirrors of that prompt still match
+        // the original occurrence before we move the boundary.
+        if implicit && dialogue.role == Role::User && first && !self.assistant.is_empty() {
+            self.assistant.clear();
+            self.user.clear();
+            self.user.entry(dialogue.text.clone()).or_default()[source] = 1;
+        }
+        first
+    }
+}
+
+#[derive(Default)]
+struct RolloutEvidence {
+    cwd: Option<String>,
+    subagent: bool,
+    paginated: bool,
+    compacted_prefix: bool,
+    saw_prompt: bool,
+    patches: Patches,
+    completed_paths: Vec<String>,
+    has_file_change: bool,
+    edits: Vec<EditEvent>,
+}
+
+impl RolloutEvidence {
+    // The dialogue budget can drop records anywhere in the source. Read the
+    // routing tags first so large compaction/tool payloads are skipped.
+    fn scan_line(&mut self, line: &str) {
+        let Ok(route) = serde_json::from_str::<Routing>(line) else {
+            return;
+        };
+        match route.tags() {
+            ("compacted", _, _)
+            | ("response_item", Some("compaction"), _)
+            | ("event_msg", Some("item_completed"), Some("ContextCompaction")) => {
+                self.compacted_prefix |= !self.saw_prompt;
+                return;
+            }
+            ("event_msg", Some("item_completed"), Some("FileChange")) => {
+                let status = route
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.item.as_ref())
+                    .and_then(|item| item.status.as_deref());
+                self.file_change(line, status, None);
+                return;
+            }
+            ("response_item", Some("function_call_output" | "custom_tool_call_output"), _) => {
+                if !route
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.call_id.as_ref())
+                    .is_some_and(|id| self.patches.single.contains_key(id))
+                {
+                    return;
+                }
+            }
+            ("response_item", Some("message"), _)
+                if route
+                    .payload
+                    .as_ref()
+                    .is_some_and(|p| p.role.as_deref() == Some("user")) => {}
+            ("session_meta" | "message", _, _)
+            | ("event_msg", Some("user_message"), _)
+            | ("event_msg", Some("item_completed"), Some("UserMessage"))
+            | ("response_item", Some("function_call" | "custom_tool_call"), _) => {}
+            _ => return,
+        }
+        if let Ok(record) = serde_json::from_str::<Value>(line) {
+            let dialogue = Dialogue::from_record(&record);
+            self.observe(&record, dialogue.as_ref());
+        }
+    }
+
+    fn observe(&mut self, record: &Value, dialogue: Option<&Dialogue>) {
+        self.saw_prompt |= dialogue.is_some_and(|d| d.role == Role::User);
+        let payload = &record["payload"];
+        match (record["type"].as_str(), payload["type"].as_str()) {
+            (Some("session_meta"), _) => {
+                self.subagent |= is_subagent_meta(record);
+                self.paginated |= payload["history_mode"] == "paginated";
+                if self.cwd.is_none() {
+                    self.cwd = super::nonblank(&payload["cwd"]).map(str::to_owned);
+                }
+            }
+            (Some("compacted"), _) | (Some("response_item"), Some("compaction")) => {
+                self.compacted_prefix |= !self.saw_prompt;
+            }
+            (Some("event_msg"), Some("item_completed"))
+                if payload["item"]["type"] == "ContextCompaction" =>
+            {
+                self.compacted_prefix |= !self.saw_prompt;
+            }
+            (Some("response_item"), Some("function_call" | "custom_tool_call")) => {
+                self.patches.call(payload);
+            }
+            (Some("response_item"), Some("function_call_output" | "custom_tool_call_output"))
+                if payload["call_id"]
+                    .as_str()
+                    .is_some_and(|id| self.patches.single.contains_key(id)) =>
+            {
+                let (output, is_error) = payload
+                    .get("output")
+                    .map(unwrap_output_value)
+                    .unwrap_or_default();
+                self.patches.result(payload, &output, is_error);
+            }
+            _ => {}
+        }
+    }
+
+    fn file_change(
+        &mut self,
+        line: &str,
+        status: Option<&str>,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.has_file_change = true;
+        if status != Some("completed") {
+            return;
+        }
+        let Ok(CompletedChange { timestamp, payload }) =
+            serde_json::from_str::<CompletedChange>(line)
+        else {
+            return;
+        };
+        let ts = ts.or_else(|| timestamp.as_deref().and_then(parse_ts));
+        for (raw, change) in payload.item.changes.0 {
+            self.completed_paths.push(raw.clone());
+            let diff = super::nonblank(&change["diff"])
+                .or_else(|| super::nonblank(&change["unified_diff"]))
+                .or_else(|| super::nonblank(&change["content"]));
+            if let (Some(path), Some(diff)) = (super::clean_path(&raw), diff) {
+                let kind = match change["type"].as_str().or_else(|| change["kind"].as_str()) {
+                    Some("add" | "write" | "create") => EditKind::Write,
+                    _ => EditKind::Edit,
+                };
+                self.edits.push(EditEvent {
+                    path,
+                    kind,
+                    snippet: super::redacted_truncate(diff, 200),
+                    ts,
+                });
+            }
+        }
+    }
+
+    fn operational_paths(&self) -> Vec<String> {
+        let paths = if self.paginated || self.has_file_change {
+            self.completed_paths.clone()
+        } else {
+            self.patches.confirmed().collect()
+        };
+        super::dedup_raw_paths(paths)
+    }
+}
+
+#[derive(Deserialize)]
+struct CompletedChange {
+    #[serde(alias = "time")]
+    timestamp: Option<String>,
+    payload: ChangePayload,
+}
+
+#[derive(Deserialize)]
+struct ChangePayload {
+    item: ChangedItem,
+}
+
+#[derive(Deserialize)]
+struct ChangedItem {
+    changes: OrderedChanges,
+}
+
+struct OrderedChanges(Vec<(String, Value)>);
+
+impl<'de> Deserialize<'de> for OrderedChanges {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct ChangesVisitor;
+        impl<'de> serde::de::Visitor<'de> for ChangesVisitor {
+            type Value = OrderedChanges;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Codex FileChange map")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut changes = Vec::new();
+                while let Some(change) = map.next_entry()? {
+                    changes.push(change);
+                }
+                Ok(OrderedChanges(changes))
+            }
+        }
+        deserializer.deserialize_map(ChangesVisitor)
     }
 }
 
@@ -464,14 +825,12 @@ fn collect_patched_paths(args: &str, out: &mut Vec<String>) {
         "*** Delete File: ",
         "*** Move to: ",
     ];
-    let normalized = args.replace("\\n", "\n");
-    for line in normalized.lines() {
-        let line = line.trim();
+    for line in args.lines() {
+        let line = line.trim_start();
         for m in MARKERS {
             if let Some(rest) = line.strip_prefix(m) {
-                let path = rest.trim().trim_matches('"');
-                if !path.is_empty() {
-                    out.push(path.to_string());
+                if !rest.is_empty() {
+                    out.push(rest.to_owned());
                 }
             }
         }
@@ -481,23 +840,36 @@ fn collect_patched_paths(args: &str, out: &mut Vec<String>) {
 /// The files one `response_item` payload patched: an apply_patch carried by a
 /// function call's arguments or by a custom tool call's input.
 fn touched_by(payload: &Value, out: &mut Vec<String>) {
-    match payload.get("type").and_then(Value::as_str) {
-        // Inspect the original JSON string so escaped patch newlines continue
-        // to contribute to provenance.
-        Some("function_call") => collect_patched_paths(
-            payload
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            out,
-        ),
-        Some("custom_tool_call") => {
-            let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
-            if let Some((_, patch)) = input.split_once("*** Begin Patch") {
-                collect_patched_paths(&format!("*** Begin Patch{patch}").replace("\\n", "\n"), out);
-            }
+    let kind = payload["type"].as_str();
+    let args = match kind {
+        Some("function_call") => payload["arguments"].as_str(),
+        Some("custom_tool_call") => payload["input"].as_str(),
+        _ => None,
+    };
+    let Some(args) = args else { return };
+    if !args.contains("*** ") {
+        return;
+    }
+    if kind == Some("function_call") {
+        let parsed = serde_json::from_str::<Value>(args).ok();
+        let native = parsed.as_ref().and_then(|v| {
+            ["patch", "input", "cmd", "command"]
+                .iter()
+                .find_map(|field| v[*field].as_str())
+        });
+        if let Some(native) = native.filter(|text| text.contains('\n')) {
+            collect_patched_paths(native, out);
+            return;
         }
-        _ => {}
+    }
+    if let Some((_, patch)) = args.split_once("*** Begin Patch") {
+        if payload["name"] == "apply_patch" && patch.contains('\n') {
+            collect_patched_paths(patch, out);
+        } else {
+            collect_patched_paths(&patch.replace("\\n", "\n"), out);
+        }
+    } else if kind == Some("function_call") {
+        collect_patched_paths(&args.replace("\\n", "\n"), out);
     }
 }
 
@@ -510,7 +882,8 @@ struct Patches {
     /// Calls that carry one patch, so their result is that patch's; true for
     /// apply_patch itself, whose error flag is the patch's error.
     single: HashMap<String, bool>,
-    failed: std::collections::HashSet<String>,
+    failed: HashSet<String>,
+    confirmed: HashSet<String>,
 }
 
 impl Patches {
@@ -553,26 +926,26 @@ impl Patches {
         };
         if failed {
             self.failed.insert(id);
+        } else if !is_error && !output.trim().is_empty() {
+            self.confirmed.insert(id);
         }
     }
 
-    /// Whether a raw line can be a result that says a patch failed.
-    fn may_report_failure(line: &str) -> bool {
-        line.contains("_output\"")
-            && (line.contains(Self::VERIFY_FAILED)
-                || line.contains("aborted by user")
-                || line.contains("exit_code")
-                || line.contains("Exit code: ")
-                || line.contains("exited with code "))
+    fn applied(&self) -> impl Iterator<Item = String> + '_ {
+        self.calls
+            .iter()
+            .filter(|(id, _)| id.as_ref().is_none_or(|id| !self.failed.contains(id)))
+            .flat_map(|(_, paths)| paths.iter().cloned())
     }
 
-    fn applied(self) -> Vec<String> {
-        let failed = self.failed;
+    fn confirmed(&self) -> impl Iterator<Item = String> + '_ {
         self.calls
-            .into_iter()
-            .filter(|(id, _)| !id.as_ref().is_some_and(|id| failed.contains(id)))
-            .flat_map(|(_, paths)| paths)
-            .collect()
+            .iter()
+            .filter(|(id, _)| {
+                id.as_ref()
+                    .is_some_and(|id| self.confirmed.contains(id) && !self.failed.contains(id))
+            })
+            .flat_map(|(_, paths)| paths.iter().cloned())
     }
 }
 
@@ -736,6 +1109,7 @@ fn push(
             role,
             text: text.to_string(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }
@@ -789,6 +1163,238 @@ fn js_cmd_literal(call: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dialogue_fixture(source: usize, role: Role, text: &str, turn: Option<&str>) -> Value {
+        let blocks = text
+            .split('\n')
+            .map(|text| json!({"text":text}))
+            .collect::<Vec<_>>();
+        let (kind, mut payload) = match (source, role) {
+            (0, _) => (
+                "response_item",
+                json!({"type":"message","role":role.label(),"content":blocks}),
+            ),
+            (1, Role::User) => ("event_msg", json!({"type":"user_message","message":text})),
+            (1, Role::Assistant) => ("event_msg", json!({"type":"agent_message","message":text})),
+            (2, Role::User | Role::Assistant) => (
+                "event_msg",
+                json!({"type":"item_completed","item":{
+                    "type":if role == Role::User { "UserMessage" } else { "AgentMessage" },
+                    "content":blocks
+                }}),
+            ),
+            _ => unreachable!(),
+        };
+        if let Some(turn) = turn {
+            payload["turn_id"] = json!(turn);
+        }
+        json!({"type":kind,"payload":payload})
+    }
+
+    fn write_rollout(file: &Path, rows: &[Value]) {
+        std::fs::write(
+            file,
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn dialogue_mirrors_preserve_same_turn_repeats_and_first_arrival_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut records = vec![
+                json!({"type":"event_msg","payload":{"type":"turn_started","turn_id":"first"}}),
+            ];
+            // Two same-text occurrences from the first source, including a
+            // late canonical mirror after the intervening assistant reply.
+            for source in order {
+                records.push(dialogue_fixture(
+                    source,
+                    Role::User,
+                    "repeat",
+                    Some("first"),
+                ));
+                records.push(dialogue_fixture(
+                    source,
+                    Role::Assistant,
+                    "same\nreply",
+                    Some("first"),
+                ));
+                records.push(dialogue_fixture(
+                    source,
+                    Role::User,
+                    "repeat",
+                    Some("first"),
+                ));
+                records.push(dialogue_fixture(
+                    source,
+                    Role::Assistant,
+                    "same\nreply",
+                    Some("first"),
+                ));
+            }
+            for source in order.into_iter().rev() {
+                records.push(dialogue_fixture(source, Role::User, "repeat", Some("next")));
+                records.push(dialogue_fixture(
+                    source,
+                    Role::Assistant,
+                    "same\nreply",
+                    Some("next"),
+                ));
+            }
+            write_rollout(&file, &records);
+            let session = Codex::default().parse(&file).unwrap();
+            let actual = session
+                .messages
+                .iter()
+                .map(|m| (m.role, m.text.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                [(Role::User, "repeat"), (Role::Assistant, "same\nreply")].repeat(3),
+                "source order {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dialogue_adopts_untagged_mirrors_before_late_turn_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let mut records = Vec::new();
+        for id in ["first", "next"] {
+            records.extend([
+                dialogue_fixture(1, Role::User, "repeat", None),
+                dialogue_fixture(1, Role::Assistant, "same reply", None),
+                dialogue_fixture(0, Role::User, "repeat", None),
+                dialogue_fixture(2, Role::User, "repeat", Some(id)),
+                dialogue_fixture(2, Role::Assistant, "same reply", Some(id)),
+                dialogue_fixture(0, Role::Assistant, "same reply", None),
+            ]);
+        }
+        write_rollout(&file, &records);
+        let s = Codex::default().parse(&file).unwrap();
+        let actual = s
+            .messages
+            .iter()
+            .map(|m| (m.role, m.text.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [(Role::User, "repeat"), (Role::Assistant, "same reply")].repeat(2)
+        );
+    }
+
+    #[test]
+    fn any_file_change_disables_legacy_operational_patch_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let legacy = [
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"x","name":"apply_patch",
+                "input":"*** Begin Patch\n*** Update File: raw  \n@@\n-old\n+new\n*** End Patch"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"x","output":"Success"}}),
+        ];
+        write_rollout(&file, &legacy);
+        let adapter = Codex::default();
+        assert_eq!(
+            adapter.parse(&file).unwrap().operational_edited_paths,
+            ["raw  "]
+        );
+        for item in [
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","status":"failed","changes":{"unrelated spelling":{}}}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","status":"declined","changes":{"raw  ":{}}}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange"}}}),
+            json!({"type":"session_meta","payload":{"history_mode":"paginated"}}),
+        ] {
+            let mut records = legacy.to_vec();
+            records.push(item);
+            write_rollout(&file, &records);
+            let s = adapter.parse(&file).unwrap();
+            assert!(
+                s.operational_edited_paths.is_empty(),
+                "{:?}",
+                s.operational_edited_paths
+            );
+            assert_eq!(s.touched, ["raw"]);
+        }
+    }
+
+    #[test]
+    fn windowed_paginated_rollout_separates_large_payloads_from_metadata_and_dialogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let records = vec![
+            json!({"type":"session_meta","payload":{"cwd":" "}}),
+            json!({"type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"text":"synthetic"}]}]}}),
+            json!({"type":"session_meta","payload":{"cwd":"/middle-only  ","history_mode":"paginated"}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","output":"x".repeat(255)}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"McpToolCall","output":"x".repeat(255)}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","status":"completed","changes":{"done  ":{"diff":"x".repeat(770)}}}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"FileChange","status":"failed","changes":{"failed":{}}}}}),
+            dialogue_fixture(2, Role::User, "middle prompt", None),
+            dialogue_fixture(2, Role::Assistant, "middle reply", None),
+            json!({"type":"response_item","payload":{"type":"function_call_output","output":"end".repeat(100)}}),
+        ];
+        let mut lines = records.iter().map(Value::to_string).collect::<Vec<_>>();
+        let payload = &records[7]["payload"];
+        lines[7] = format!(r#"{{ "payload" : {payload}, "type" : "event_msg" }}"#);
+        std::fs::write(&file, lines.join("\n")).unwrap();
+        crate::util::TEST_WINDOW.with(|w| w.set(Some((400, 70, 70))));
+        crate::util::TEST_MIDDLE_BYTES.with(|w| w.set(Some(400)));
+        let session = Codex::default().parse(&file).unwrap();
+        crate::util::TEST_WINDOW.with(|w| w.set(None));
+        crate::util::TEST_MIDDLE_BYTES.with(|w| w.set(None));
+        assert!(session.title.starts_with("[large]"));
+        assert!(session.compacted_prefix);
+        assert_eq!(session.raw_cwd.as_deref(), Some("/middle-only  "));
+        assert_eq!(session.operational_edited_paths, ["done  "]);
+        assert_eq!(session.touched, ["done"]);
+        assert_eq!(session.edits[0].path, "done");
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["middle prompt", "middle reply"]
+        );
+    }
+
+    #[test]
+    fn compaction_markers_only_describe_missing_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rollout-test.jsonl");
+        let prompt = dialogue_fixture(1, Role::User, "real prompt", None);
+        for marker in [
+            json!({"type":"compacted","payload":{"replacement_history":[{"type":"message","role":"user","content":[{"text":"synthetic"}]}]}}),
+            json!({"type":"response_item","payload":{"type":"compaction","encrypted_content":"secret"}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"ContextCompaction"}}}),
+        ] {
+            for (records, prefix) in [
+                (vec![marker.clone(), prompt.clone()], true),
+                (vec![prompt.clone(), marker], false),
+            ] {
+                write_rollout(&file, &records);
+                let session = Codex::default().parse(&file).unwrap();
+                assert_eq!(session.compacted_prefix, prefix);
+                assert_eq!(session.raw_cwd, None);
+                assert_eq!(session.messages.len(), 1);
+                assert_eq!(session.messages[0].text, "real prompt");
+            }
+        }
+    }
 
     /// An embedder points one adapter at each Codex install. The adapter must
     /// find that install's rollouts and claim only that install's rows for

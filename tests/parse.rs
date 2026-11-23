@@ -983,6 +983,17 @@ fn opencode_v2_sqlite_session() {
     assert_eq!(s.tool, "opencode");
     assert_eq!(s.title, "Migrate authentication to JWT");
     assert_eq!(s.project, "/home/developer/opencode-v2-demo");
+    assert_eq!(
+        s.raw_cwd.as_deref(),
+        Some("/home/developer/opencode-v2-demo")
+    );
+    assert_eq!(
+        adapter
+            .native_id(&format!("{}\u{1f}ses_v2_sanitized_001", path.display()))
+            .as_deref(),
+        Some("ses_v2_sanitized_001")
+    );
+    assert_eq!(s.operational_edited_paths, ["src/auth.ts"]);
     assert!(!s.subagent);
     assert_eq!(roles(&s), ["user", "assistant", "tool", "assistant"]);
     assert_eq!(s.touched, ["src/auth.ts"]);

@@ -215,6 +215,7 @@ fn native_summary_supplies_workspace_title_and_parent() {
     let store = a.store().unwrap();
     let s = a.parse_key(&store.keys[0].0).unwrap();
     assert_eq!(s.project, "/work/my project");
+    assert_eq!(s.raw_cwd.as_deref(), Some("/work/my project"));
     assert_eq!(s.title, "Native title");
     assert!(s.subagent);
 }

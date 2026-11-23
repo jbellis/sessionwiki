@@ -383,8 +383,12 @@ impl Adapter for SearchAdapter {
                 role: Role::User,
                 text: std::fs::read_to_string(path)?,
                 ts: None,
+                is_thought: false,
                 tool: None,
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec![],
             edits: vec![],
         })

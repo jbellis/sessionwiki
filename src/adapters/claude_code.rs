@@ -46,6 +46,10 @@ fn is_transcript(path: &Path) -> bool {
 }
 
 impl Adapter for ClaudeCode {
+    fn native_id(&self, key: &str) -> Option<String> {
+        super::filename_stem(Path::new(key))
+    }
+
     fn name(&self) -> &'static str {
         "claude-code"
     }
@@ -85,6 +89,10 @@ impl Adapter for ClaudeCode {
     }
 
     fn parse(&self, path: &Path) -> Result<Session> {
+        anyhow::ensure!(
+            path.symlink_metadata()?.is_file(),
+            "Claude transcript is not a regular file"
+        );
         // A session over the byte cap is WINDOWED (head+tail) rather than
         // dropped, so the biggest sessions - the ones most worth referencing -
         // stay searchable and partially readable.
@@ -95,10 +103,10 @@ impl Adapter for ClaudeCode {
                 || (line.contains("\"type\":\"assistant\"") && line.contains("\"type\":\"text\""))
         })?;
 
+        let mut native = NativeEvidence::default();
         let mut messages: Vec<Message> = Vec::new();
         let mut edit_calls: Vec<(Option<String>, crate::model::EditEvent)> = Vec::new();
         let mut failed_calls = std::collections::HashSet::new();
-        let mut cwd: Option<String> = None;
         let mut summary: Option<String> = None;
         let mut ai_title: Option<String> = None;
         let mut started = None;
@@ -109,10 +117,11 @@ impl Adapter for ClaudeCode {
                 continue;
             };
 
-            if cwd.is_none() {
-                if let Some(c) = v.get("cwd").and_then(Value::as_str) {
-                    cwd = Some(c.to_string());
-                }
+            if !windowed {
+                native.observe(&v, false);
+            }
+            if compact_marker(&v) {
+                continue;
             }
             if let Some(ts) = v
                 .get("timestamp")
@@ -228,56 +237,25 @@ impl Adapter for ClaudeCode {
             }
         }
 
-        // The window drops the middle of the file, and with it the files the
-        // session edited there. Those are read from the whole file: only lines
-        // that carry a tool call are parsed.
         if windowed {
-            let mut all_calls = Vec::new();
-            let mut all_failed = std::collections::HashSet::new();
-            let read = crate::util::for_each_line(path, |line| {
-                let failed_result = has_error_true(line);
-                if !line.contains("\"tool_use\"") && !failed_result {
-                    return;
-                }
-                let Ok(v) = serde_json::from_str::<Value>(line) else {
-                    return;
-                };
-                if failed_result && v.get("type").and_then(Value::as_str) == Some("user") {
-                    if let Some(Value::Array(blocks)) = v.pointer("/message/content") {
-                        for b in blocks {
-                            note_failed_call(b, &mut all_failed);
-                        }
-                    }
-                    return;
-                }
-                if v.get("type").and_then(Value::as_str) != Some("assistant") {
-                    return;
-                }
-                let ts = v
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .and_then(parse_ts);
-                let Some(Value::Array(blocks)) = v.pointer("/message/content") else {
-                    return;
-                };
-                for b in blocks {
-                    if b.get("type").and_then(Value::as_str) != Some("tool_use") {
-                        continue;
-                    }
-                    let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
-                    if let Some(ev) = edit_event(name, b.get("input"), ts) {
-                        all_calls.push((call_id(b), ev));
-                    }
-                }
-            });
-            if read.is_ok() {
-                edit_calls = all_calls;
-                failed_calls = all_failed;
-            }
+            native = scan_native(path, true)?;
+            edit_calls = std::mem::take(&mut native.display_calls);
+            failed_calls = std::mem::take(&mut native.failed);
         }
         let (touched, edits) = applied_edits(edit_calls, &failed_calls);
-
-        let project = cwd.unwrap_or_else(|| {
+        let mut raw_paths = native.take_paths();
+        if let Some(stem) = path.file_stem() {
+            let session_dir = path.with_file_name(stem);
+            // WalkDir checks the root and its entries. Check the intermediate
+            // session directory as well so a symlink there cannot escape.
+            if session_dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                for file in super::nested_jsonl(&session_dir.join("subagents"))? {
+                    raw_paths.extend(scan_native(&file, false)?.take_paths());
+                }
+            }
+        }
+        let raw_cwd = native.cwd;
+        let project = raw_cwd.clone().unwrap_or_else(|| {
             // Fall back to the sanitized directory name.
             path.parent()
                 .and_then(|p| p.file_name())
@@ -306,6 +284,9 @@ impl Adapter for ClaudeCode {
             title,
             subagent,
             messages,
+            raw_cwd,
+            operational_edited_paths: super::dedup_raw_paths(raw_paths),
+            compacted_prefix: native.compacted_prefix,
             touched: dedup_paths(touched),
             edits,
         })
@@ -325,6 +306,9 @@ fn edited_path(name: &str, input: Option<&Value>) -> Option<String> {
         return None;
     }
     let input = input?;
+    if name == "str_replace_based_edit_tool" && input["command"] == "view" {
+        return None;
+    }
     for key in ["file_path", "notebook_path", "path"] {
         if let Some(p) = input.get(key).and_then(Value::as_str) {
             if !p.is_empty() {
@@ -337,16 +321,113 @@ fn edited_path(name: &str, input: Option<&Value>) -> Option<String> {
 
 const SNIPPET_CAP: usize = 200;
 
-/// A cheap prefilter for a line carrying `"is_error": true`, however the JSON
-/// is spaced. Tool results are the bulk of a large transcript, so the windowed
-/// read parses only these.
-fn has_error_true(line: &str) -> bool {
-    line.match_indices("\"is_error\"").any(|(at, field)| {
-        line[at + field.len()..]
-            .trim_start()
-            .strip_prefix(':')
-            .is_some_and(|rest| rest.trim_start().starts_with("true"))
-    })
+fn compact_marker(record: &Value) -> bool {
+    (record["type"] == "system"
+        && matches!(
+            record["subtype"].as_str(),
+            Some("compact_boundary" | "compaction")
+        ))
+        || record["isCompactSummary"] == true
+        || record["message"]["isCompactSummary"] == true
+}
+
+#[derive(Default)]
+struct NativeEvidence {
+    cwd: Option<String>,
+    compacted_prefix: bool,
+    saw_prompt: bool,
+    candidates: Vec<(Option<String>, String)>,
+    completed: std::collections::HashSet<String>,
+    display_calls: Vec<(Option<String>, crate::model::EditEvent)>,
+    failed: std::collections::HashSet<String>,
+}
+
+impl NativeEvidence {
+    fn observe(&mut self, record: &Value, windowed: bool) {
+        if self.cwd.is_none() {
+            self.cwd = super::nonblank(&record["cwd"]).map(str::to_owned);
+        }
+        if compact_marker(record) {
+            self.compacted_prefix |= !self.saw_prompt;
+            return;
+        }
+        if record["type"] == "file-history-delta" {
+            if let Some(tracking) = record["trackingPath"].as_str().filter(|p| !p.is_empty()) {
+                let path = Path::new(tracking);
+                let backup = record
+                    .pointer("/backup/realParentDir")
+                    .and_then(Value::as_str);
+                let raw = match (path.is_relative(), backup, path.file_name()) {
+                    (true, Some(parent), Some(name)) => {
+                        Path::new(parent).join(name).to_string_lossy().into_owned()
+                    }
+                    _ => tracking.to_owned(),
+                };
+                self.candidates.push((None, raw));
+            }
+        }
+        let content = &record["message"]["content"];
+        let blocks = content.as_array().into_iter().flatten();
+        match record["type"].as_str() {
+            Some("user") => {
+                if record["isMeta"] != true && record["isSidechain"] != true {
+                    self.saw_prompt |= super::nonblank(content).is_some()
+                        || blocks
+                            .clone()
+                            .any(|b| b["type"] == "text" && super::nonblank(&b["text"]).is_some());
+                }
+                for block in blocks.filter(|b| b["type"] == "tool_result") {
+                    if block["is_error"] != true {
+                        if let Some(id) = super::nonblank(&block["tool_use_id"]) {
+                            self.completed.insert(id.to_owned());
+                        }
+                    } else if windowed {
+                        note_failed_call(block, &mut self.failed);
+                    }
+                }
+            }
+            Some("assistant") => {
+                let ts = record["timestamp"].as_str().and_then(parse_ts);
+                for block in blocks.filter(|b| b["type"] == "tool_use") {
+                    let name = block["name"].as_str().unwrap_or_default();
+                    if matches!(
+                        name,
+                        "Edit" | "Write" | "NotebookEdit" | "str_replace_based_edit_tool"
+                    ) {
+                        if let (Some(id), Some(raw)) =
+                            (call_id(block), edited_path(name, block.get("input")))
+                        {
+                            self.candidates.push((Some(id), raw));
+                        }
+                    }
+                    if windowed {
+                        if let Some(edit) = edit_event(name, block.get("input"), ts) {
+                            self.display_calls.push((call_id(block), edit));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn take_paths(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.candidates)
+            .into_iter()
+            .filter(|(id, _)| id.as_ref().is_none_or(|id| self.completed.contains(id)))
+            .map(|(_, path)| path)
+            .collect()
+    }
+}
+
+fn scan_native(path: &Path, windowed: bool) -> Result<NativeEvidence> {
+    let mut evidence = NativeEvidence::default();
+    crate::util::for_each_line(path, |line| {
+        if let Ok(record) = serde_json::from_str(line) {
+            evidence.observe(&record, windowed);
+        }
+    })?;
+    Ok(evidence)
 }
 
 fn call_id(block: &Value) -> Option<String> {
@@ -444,6 +525,7 @@ fn push(
             role,
             text: text.to_string(),
             ts,
+            is_thought: false,
             tool: None,
         });
     }

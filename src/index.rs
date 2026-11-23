@@ -3245,6 +3245,7 @@ pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::
                 role,
                 text,
                 ts: None,
+                is_thought: false,
                 tool,
             })
         })?
@@ -3273,6 +3274,9 @@ pub fn session_from_index(conn: &Connection, row: &SessionRow) -> Result<crate::
         title: row.title.clone(),
         subagent: row.kind == "sub",
         messages,
+        raw_cwd: None,
+        operational_edited_paths: Vec::new(),
+        compacted_prefix: false,
         touched: files_for(conn, &row.session_id)?,
         edits: Vec::new(),
     })
@@ -3762,6 +3766,9 @@ mod edits_tests {
             title: "t".into(),
             subagent: false,
             messages: vec![],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec!["/proj/src/auth.rs".into()],
             edits: vec![EditEvent {
                 path: "/proj/src/auth.rs".into(),
@@ -3922,8 +3929,12 @@ mod edits_tests {
                 role: Role::User,
                 text: "my key is sk-abcdef012345678901234567890123 ok".into(),
                 ts: None,
+                is_thought: false,
                 tool: None,
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: vec!["/p/a.rs".into()],
             edits: vec![EditEvent {
                 path: "/p/a.rs".into(),
@@ -4008,6 +4019,9 @@ mod edits_tests {
                 title: format!("{sid} title"),
                 subagent: false,
                 messages: vec![],
+                raw_cwd: None,
+                operational_edited_paths: Vec::new(),
+                compacted_prefix: false,
                 touched: vec!["/proj/src/a.rs".into()],
                 edits: vec![EditEvent {
                     path: "/proj/src/a.rs".into(),
@@ -4161,8 +4175,12 @@ mod embedder_hook_tests {
                     role: Role::User,
                     text: "make the tests green".into(),
                     ts: None,
+                    is_thought: false,
                     tool: None,
                 }],
+                raw_cwd: None,
+                operational_edited_paths: Vec::new(),
+                compacted_prefix: false,
                 touched: vec![],
                 edits: vec![],
             })
@@ -4536,6 +4554,7 @@ mod embedder_hook_tests {
                 role: Role::Tool,
                 text: "stable tool summary".into(),
                 ts: None,
+                is_thought: false,
                 tool: Some(ToolEvent::Summary(ToolSummary {
                     name: "Bash".into(),
                     args: serde_json::json!({}),
@@ -4544,6 +4563,9 @@ mod embedder_hook_tests {
                     lines: Some(1),
                 })),
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: Vec::new(),
             edits: Vec::new(),
         };
@@ -4707,6 +4729,7 @@ mod tool_output_tests {
                 role: Role::Tool,
                 text: "→ Bash(cargo test) ⇒ ok · 2 lines".into(),
                 ts: None,
+                is_thought: false,
                 tool: Some(ToolEvent::Summary(ToolSummary {
                     name: "Bash".into(),
                     args: serde_json::json!({"command": "cargo test"}),
@@ -4715,6 +4738,9 @@ mod tool_output_tests {
                     lines: Some(2),
                 })),
             }],
+            raw_cwd: None,
+            operational_edited_paths: Vec::new(),
+            compacted_prefix: false,
             touched: Vec::new(),
             edits: Vec::new(),
         }

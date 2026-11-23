@@ -24,7 +24,7 @@ pub struct KimiCode {
 #[derive(Default)]
 struct IndexSnapshot {
     indexed: BTreeMap<String, (PathBuf, PathBuf)>,
-    recorded_cwds: HashMap<String, PathBuf>,
+    recorded_cwds: HashMap<String, String>,
     had_error: bool,
 }
 
@@ -100,7 +100,7 @@ impl KimiCode {
             .or_else(|| self.home())
     }
 
-    fn indexed_cwd(&self, path: &Path) -> Option<PathBuf> {
+    fn indexed_cwd(&self, path: &Path) -> Option<String> {
         let id = path.file_name()?.to_str()?;
         let home = self.session_home(path)?;
         self.index_snapshot(&home).recorded_cwds.get(id).cloned()
@@ -169,12 +169,8 @@ fn parse_index(text: &str) -> IndexSnapshot {
             continue;
         };
         // Keep cwd evidence for named directories, including tombstoned ones.
-        if let Some(cwd) = record["workDir"]
-            .as_str()
-            .map(PathBuf::from)
-            .filter(|cwd| cwd.is_absolute())
-        {
-            snapshot.recorded_cwds.insert(id.to_owned(), cwd);
+        if let Some(cwd) = super::nonblank(&record["workDir"]) {
+            snapshot.recorded_cwds.insert(id.to_owned(), cwd.to_owned());
         }
         // The append-only index's last complete entry wins. Never resurrect
         // an unindexed directory by walking it.
@@ -200,6 +196,10 @@ fn parse_index(text: &str) -> IndexSnapshot {
 }
 
 impl Adapter for KimiCode {
+    fn native_id(&self, key: &str) -> Option<String> {
+        super::directory_name(Path::new(key))
+    }
+
     fn name(&self) -> &'static str {
         "kimi-code"
     }
@@ -315,32 +315,53 @@ impl Adapter for KimiCode {
     fn parse(&self, path: &Path) -> Result<Session> {
         let path = absolute(path);
         let state = read_json_optional(&path.join("state.json"))?;
-        let cwd = ["workDir", "cwd"]
+        let indexed_cwd = self.indexed_cwd(&path);
+        let state_cwds = ["workDir", "cwd"]
             .into_iter()
-            .filter_map(|key| state[key].as_str())
-            .map(PathBuf::from)
-            .find(|p| p.is_absolute())
-            .or_else(|| self.indexed_cwd(&path));
-        let wire = if path.join("agents/main/wire.jsonl").is_file() {
+            .filter_map(|key| super::nonblank(&state[key]));
+        let project = state_cwds
+            .clone()
+            .chain(indexed_cwd.as_deref())
+            .find(|cwd| Path::new(cwd).is_absolute())
+            .unwrap_or_default()
+            .to_owned();
+        let raw_cwd = state_cwds
+            .chain(indexed_cwd.as_deref())
+            .next()
+            .map(str::to_owned);
+        let wire = if ["agents", "agents/main"]
+            .into_iter()
+            .all(|part| path.join(part).symlink_metadata().is_ok_and(|m| m.is_dir()))
+            && path
+                .join("agents/main/wire.jsonl")
+                .symlink_metadata()
+                .is_ok_and(|m| m.is_file())
+        {
             path.join("agents/main/wire.jsonl")
         } else {
             path.join("wire.jsonl")
         };
+        anyhow::ensure!(
+            wire.symlink_metadata()?.is_file(),
+            "Kimi wire is not a regular file"
+        );
         let (lines, windowed) = crate::util::session_lines_keeping(&wire, |line| {
             serde_json::from_str::<Value>(line).is_ok_and(|r| {
                 matches!(r["type"].as_str(), Some("turn.prompt" | "turn.steer"))
                     || r.pointer("/event/part/type").and_then(Value::as_str) == Some("text")
             })
         })?;
+        let mut evidence = WireEvidence::default();
         let mut messages = Vec::new();
         let mut started = timestamp(&state["createdAt"]);
         let mut ended = timestamp(&state["updatedAt"]);
-        let mut edit_calls = HashMap::new();
-        let mut completed = HashSet::new();
         for line in lines {
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if !windowed {
+                evidence.observe(&record);
+            }
             let ts = record_ts(&record);
             if let Some(t) = ts {
                 started = Some(started.map_or(t, |old| old.min(t)));
@@ -377,14 +398,6 @@ impl Adapter for KimiCode {
                             let id = event["toolCallId"].as_str().map(str::to_owned);
                             let name = event["name"].as_str().unwrap_or("?");
                             let mut args = event.get("args").cloned().unwrap_or(Value::Null);
-                            if matches!(name, "Edit" | "Write") {
-                                if let (Some(id), Some(path)) = (
-                                    &id,
-                                    args["path"].as_str().or_else(|| args["file_path"].as_str()),
-                                ) {
-                                    edit_calls.insert(id.clone(), path.to_owned());
-                                }
-                            }
                             redact_json(&mut args);
                             messages.push(Message::tool_call(
                                 ts,
@@ -399,11 +412,6 @@ impl Adapter for KimiCode {
                             let call_id = event["toolCallId"].as_str().map(str::to_owned);
                             let result = &event["result"];
                             let is_error = result["isError"].as_bool().unwrap_or(false);
-                            if !is_error {
-                                if let Some(id) = &call_id {
-                                    completed.insert(id.clone());
-                                }
-                            }
                             messages.push(Message::tool_result(
                                 ts,
                                 ToolResult {
@@ -435,31 +443,23 @@ impl Adapter for KimiCode {
             .filter(|t| !t.trim().is_empty())
             .map(|t| redacted_truncate(t, 80))
             .unwrap_or_else(|| title_from_messages(&messages));
-        let mut touched: Vec<String> = edit_calls
-            .into_iter()
-            .filter(|(id, _)| completed.contains(id))
-            .map(|(_, path)| path)
-            .collect();
         if windowed {
-            // Text is windowed, but provenance must cover the whole stream.
-            touched = wire_edits(&wire)?;
+            evidence = wire_evidence(&wire)?;
         }
-        let mut listing_error = false;
-        for agent in directories(&path.join("agents"), &mut listing_error) {
-            let sub_wire = agent.join("wire.jsonl");
-            if sub_wire != wire && sub_wire.is_file() {
-                // Agent ids have their own call-id namespace. Read only their
-                // edit evidence; their conversations are not the main session.
-                touched.extend(wire_edits(&sub_wire)?);
-            }
+        let compacted_prefix = evidence.compacted_prefix;
+        let mut touched = evidence.applied();
+        for sub_wire in super::nested_jsonl(&path.join("agents"))?
+            .into_iter()
+            .filter(|p| *p != wire)
+        {
+            // Every wire owns a separate call-id namespace.
+            touched.extend(wire_evidence(&sub_wire)?.applied());
         }
         Ok(Session {
             id: short_id(&path.to_string_lossy()),
             tool: self.name(),
             path,
-            project: cwd
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            project,
             started,
             ended,
             title: if windowed {
@@ -469,21 +469,36 @@ impl Adapter for KimiCode {
             },
             subagent: false,
             messages,
+            raw_cwd,
+            operational_edited_paths: super::dedup_raw_paths(touched.clone()),
+            compacted_prefix,
             touched: dedup_paths(touched),
             edits: Vec::new(),
         })
     }
 }
 
-fn wire_edits(path: &Path) -> Result<Vec<String>> {
-    let mut calls = HashMap::new();
-    let mut completed = HashSet::new();
-    crate::util::for_each_line(path, |line| {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        if record["type"].as_str() != Some("context.append_loop_event") {
-            return;
+#[derive(Default)]
+struct WireEvidence {
+    calls: Vec<(String, String)>,
+    completed: HashSet<String>,
+    saw_prompt: bool,
+    compacted_prefix: bool,
+}
+
+impl WireEvidence {
+    fn observe(&mut self, record: &Value) {
+        match record["type"].as_str() {
+            Some("context.compaction" | "context.compacted" | "compaction") => {
+                self.compacted_prefix |= !self.saw_prompt;
+                return;
+            }
+            Some("turn.prompt" | "turn.steer") if record["origin"]["kind"] == "user" => {
+                self.saw_prompt |= !content_text(&record["input"]).trim().is_empty();
+                return;
+            }
+            Some("context.append_loop_event") => {}
+            _ => return,
         }
         let event = &record["event"];
         let Some(id) = event["toolCallId"].as_str() else {
@@ -491,24 +506,38 @@ fn wire_edits(path: &Path) -> Result<Vec<String>> {
         };
         match event["type"].as_str() {
             Some("tool.call") if matches!(event["name"].as_str(), Some("Edit" | "Write")) => {
-                if let Some(path) = event["args"]["path"]
-                    .as_str()
-                    .or_else(|| event["args"]["file_path"].as_str())
+                if let Some(path) = event["args"]
+                    .get("path")
+                    .or_else(|| event["args"].get("file_path"))
+                    .and_then(Value::as_str)
                 {
-                    calls.insert(id.to_owned(), path.to_owned());
+                    self.calls.push((id.to_owned(), path.to_owned()));
                 }
             }
             Some("tool.result") if event["result"]["isError"].as_bool() != Some(true) => {
-                completed.insert(id.to_owned());
+                self.completed.insert(id.to_owned());
             }
             _ => {}
         }
+    }
+
+    fn applied(self) -> Vec<String> {
+        self.calls
+            .into_iter()
+            .filter(|(id, _)| self.completed.contains(id))
+            .map(|(_, path)| path)
+            .collect()
+    }
+}
+
+fn wire_evidence(path: &Path) -> Result<WireEvidence> {
+    let mut evidence = WireEvidence::default();
+    crate::util::for_each_line(path, |line| {
+        if let Ok(record) = serde_json::from_str(line) {
+            evidence.observe(&record);
+        }
     })?;
-    Ok(calls
-        .into_iter()
-        .filter(|(id, _)| completed.contains(id))
-        .map(|(_, path)| path)
-        .collect())
+    Ok(evidence)
 }
 
 fn valid_component(id: &str) -> bool {
@@ -654,6 +683,7 @@ fn push_text(
         role,
         text: text.to_owned(),
         ts,
+        is_thought: false,
         tool: None,
     });
 }
