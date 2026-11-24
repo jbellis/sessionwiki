@@ -11,6 +11,49 @@ use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::path::PathBuf;
 
+fn has_message_updated(conn: &Connection) -> rusqlite::Result<bool> {
+    // Older schemas and synthetic databases can omit this message column.
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_message')
+                       WHERE name = 'time_updated')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+pub(super) fn inventory_sql(conn: &Connection) -> rusqlite::Result<&'static str> {
+    Ok(if has_message_updated(conn)? {
+        "SELECT s.id, s.time_updated, s.time_created, m.updated
+         FROM session_v2 AS s
+         LEFT JOIN (
+             SELECT session_id, max(time_updated) AS updated
+             FROM session_message GROUP BY session_id
+         ) AS m ON m.session_id = s.id"
+    } else {
+        "SELECT id, time_updated, time_created, NULL FROM session_v2"
+    })
+}
+
+pub(super) fn latest_message_update(conn: &Connection, sid: &str) -> rusqlite::Result<Option<i64>> {
+    if has_message_updated(conn)? {
+        conn.query_row(
+            "SELECT max(time_updated) FROM session_message WHERE session_id = ?1",
+            [sid],
+            |row| row.get(0),
+        )
+    } else {
+        Ok(None)
+    }
+}
+
+pub(super) fn activity_millis(
+    created: Option<i64>,
+    updated: Option<i64>,
+    message_updated: Option<i64>,
+) -> Option<i64> {
+    updated.max(message_updated).or(created)
+}
+
 pub(super) fn parse(
     tool: &'static str,
     conn: &Connection,
@@ -38,6 +81,7 @@ pub(super) fn parse(
         },
     )?;
 
+    let message_updated = latest_message_update(conn, sid)?;
     let mut stmt = conn.prepare(
         "SELECT type, time_created, data FROM session_message
          WHERE session_id = ?1 ORDER BY seq ASC, id ASC LIMIT 200000",
@@ -73,6 +117,9 @@ pub(super) fn parse(
                 }
             }
             "assistant" => {
+                if let Some(files) = data.pointer("/snapshot/files").and_then(Value::as_array) {
+                    touched.extend(files.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
                 if let Some(content) = data.get("content").and_then(Value::as_array) {
                     for item in content {
                         let itype = item.get("type").and_then(Value::as_str).unwrap_or("");
@@ -117,7 +164,7 @@ pub(super) fn parse(
                     ));
                     let status = data.get("status").and_then(Value::as_str);
                     if data.get("output").is_some()
-                        || matches!(status, Some("exited" | "timeout" | "killed"))
+                        || matches!(status, Some("exited" | "timeout" | "killed" | "error"))
                     {
                         let text = data
                             .get("output")
@@ -158,12 +205,19 @@ pub(super) fn parse(
         path: PathBuf::from(display_path(key)),
         project: raw_cwd.clone().unwrap_or_default(),
         started: created.and_then(DateTime::from_timestamp_millis),
-        ended: updated.and_then(DateTime::from_timestamp_millis),
+        ended: activity_millis(created, updated, message_updated)
+            .and_then(DateTime::from_timestamp_millis),
         title,
         subagent: parent.is_some_and(|p| !p.is_empty()),
         messages,
         raw_cwd,
-        operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
+        operational_edited_paths: crate::adapters::dedup_raw_paths(
+            touched
+                .iter()
+                .filter(|path| clean_path(path).is_some())
+                .cloned()
+                .collect(),
+        ),
         compacted_prefix: false,
         touched: dedup_paths(touched),
         edits,
@@ -243,9 +297,11 @@ fn emit_tool_part_v2(
     if let Some(path) =
         edited_path_v2(&tool_lower, input).filter(|_| status == Some("completed") && !is_error)
     {
-        touched.push(path);
-        if let Some(ev) = edit_event_v2(&tool_lower, input, ts) {
-            edits.push(ev);
+        if let Some(clean) = clean_path(&path) {
+            touched.push(clean);
+            if let Some(ev) = edit_event_v2(&tool_lower, input, ts) {
+                edits.push(ev);
+            }
         }
     }
 

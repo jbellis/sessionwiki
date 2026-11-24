@@ -993,10 +993,19 @@ fn opencode_v2_sqlite_session() {
             .as_deref(),
         Some("ses_v2_sanitized_001")
     );
-    assert_eq!(s.operational_edited_paths, ["src/auth.ts"]);
+    assert_eq!(
+        s.operational_edited_paths,
+        ["src/auth.ts", "src/routes.ts", "scripts/rebuild.sh"]
+    );
     assert!(!s.subagent);
-    assert_eq!(roles(&s), ["user", "assistant", "tool", "assistant"]);
-    assert_eq!(s.touched, ["src/auth.ts"]);
+    assert_eq!(
+        roles(&s),
+        ["user", "assistant", "tool", "assistant", "tool", "tool"]
+    );
+    assert_eq!(
+        s.touched,
+        ["src/auth.ts", "src/routes.ts", "scripts/rebuild.sh"]
+    );
     assert_eq!(s.edits.len(), 1);
     assert_eq!(s.edits[0].path, "src/auth.ts");
     assert_eq!(

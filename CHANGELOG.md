@@ -6,6 +6,42 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.29] - 2026-11-24
+
+Merges upstream SessionWiki 0.34.24 through 0.34.26 into the fork. The index
+schema stays at version 9, and every 0.34.28 fork API is unchanged.
+
+### Added
+
+- OpenCode 2.x reading is updated to the reviewed upstream implementation
+  (#131). Files recorded in assistant snapshots count as touched paths, so
+  `trace` finds sessions whose edits came through shell commands or patches. A
+  shell command that finishes later refreshes the session's indexed result and
+  date from the grouped `session_message.time_updated` watermark, and the v2
+  change token covers both session and message watermarks. A v2 row keeps its
+  session ID even when its timestamps are unreadable, a failed shell with no
+  output now emits a failed tool result, and OpenCode's native migration state
+  is validated before v1 copies are treated as live. The fork's `raw_cwd`,
+  `operational_edited_paths` and `Adapter::native_id` for OpenCode are kept.
+  Restart any running `sessionwiki mcp` servers after upgrading.
+
+### Fixed
+
+- OpenCode's v2 pre-release `opencode-next.db` is no longer read as a v1
+  channel database (#136). A file under that name with the `project`, `session`
+  and `session_message` layout is skipped; a real v1 database under that name
+  is still read.
+- `scripts/install.sh` reads the whole GitHub release response, so a
+  successful install no longer prints `curl: (23) Failure writing output to
+  destination` (#139).
+
+### Maintenance
+
+- Update rusqlite from 0.41.1 to 0.43.0 (#134). The bundled SQLite stays
+  3.54.1. rusqlite 0.43 refuses to prepare empty or comment-only SQL; every
+  statement prepared here is a non-empty SELECT, UPDATE or DELETE, and
+  migrations run through `execute_batch`.
+
 ## [0.34.28] - 2026-11-22
 
 ### Added
