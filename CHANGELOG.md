@@ -6,12 +6,117 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
-## [0.34.22] - 2026-11-18
-
 ### Added
 
 - Expose per-adapter indexing progress through `sync_with_progress`, while
   keeping `sync_with` output unchanged.
+
+## [0.34.26] - 2026-11-24
+
+### Added
+
+- OpenCode 2.x sessions are indexed (#131, thanks @jbellis and
+  @AlexZander85). OpenCode 2.x keeps its sessions in `session_v2` and
+  `session_message`, next to the v1 tables it migrated from, and sessionwiki
+  read only the v1 tables, so sessions started in OpenCode 2.x were missing
+  from `list`, `search` and `trace`. Both generations are now read from the
+  same database, with the same session IDs and keys as before. OpenCode's own
+  migration state decides which v1 rows are still current, so a v1 copy cannot
+  bring back a session you deleted in 2.x, and a v2 row that cannot be read is
+  reported instead of falling back to its v1 copy. Files recorded in assistant
+  snapshots count as touched, so `trace` also finds sessions whose edits came
+  through shell commands or patches. A shell command that finishes later
+  refreshes the session's indexed result and date. Restart any running
+  `sessionwiki mcp` servers after upgrading: an older server reads only the v1
+  tables, so on a store OpenCode 2.x has migrated, its syncs would keep
+  re-indexing these sessions the old way.
+
+### Fixed
+
+- `scripts/install.sh` no longer prints `curl: (23) Failure writing output to
+  destination` on a successful install. It looked up the latest tag with
+  `grep -m1`, which stops reading at the first match, so curl could fail
+  writing the rest of the GitHub API response. Whether it did depended on how
+  the response arrived, so the line showed up on some installs and not others.
+  The lookup now reads the whole response. The README's `curl | sh` command
+  fetches the script from `main`, so the fix reaches new installs without a
+  release.
+
+## [0.34.25] - 2026-11-23
+
+### Fixed
+
+- OpenCode: `opencode-next.db` is no longer read as a v1 channel database
+  (#133). That file is OpenCode's v2 pre-release database; OpenCode 2.1.1
+  imports it into `opencode.db` during its v1-to-v2 migration and leaves it in
+  place. sessionwiki listed its sessions as v1 sessions and then failed to
+  parse each one ("no such table: message"), so every sync printed one warning
+  per session. A file under that name with OpenCode's pre-release layout
+  (`project`, `session` and `session_message` tables) is now skipped, the same
+  test OpenCode uses before importing it. A v1 database under that name is
+  still read.
+
+## [0.34.24] - 2026-11-19
+
+### Maintenance
+
+- Update rusqlite from 0.41.1 to 0.43.0 (#134). The bundled SQLite stays
+  3.54.1. rusqlite 0.43 refuses to prepare empty or comment-only SQL; every
+  statement sessionwiki prepares is a non-empty SELECT, UPDATE or DELETE, and
+  migrations run through `execute_batch`, which still accepts them. The
+  use-after-free fixes in 0.42 and 0.43 are in features sessionwiki does not
+  enable. A sample of 40 real Claude Code and Codex sessions indexes to the
+  same rows on 0.41.1 and 0.43.0 and passes the FTS integrity check.
+
+## [0.34.23] - 2026-11-10
+
+### Maintenance
+
+- The release workflow builds the macOS binaries on the `macos-15` runner.
+  GitHub retired `macos-14` from Actions on 2026-11-02, so the macOS builds of
+  0.34.22 were cancelled before they started: that release has only the Linux
+  and Windows archives and was not published to npm, crates.io or Homebrew.
+  Its changes, listed under 0.34.22 below, reach those channels with this
+  release. The signing identity is unchanged, so macOS keeps folder-access
+  grants across the update.
+
+## [0.34.22] - 2026-11-10
+
+### Fixed
+
+- A sync no longer rewrites every message of a session that changed. It keeps
+  the stored messages that still match the session file and replaces only
+  those from the first difference on, so a session that gained one message
+  writes one `messages` row and one search-index row and deletes none. Before,
+  each sync deleted and reinserted the whole session, and with the trigram
+  tokenizer a delete costs about as much as an insert: a program that embeds
+  SessionWiki and syncs about 66 active sessions used about half a CPU core
+  continuously. A message that did not change now keeps its id. The search for
+  terms too short for the trigram index lists matches newest first by that id,
+  so it no longer moves a session to the top only because the session changed.
+- A sync no longer reads the whole Codex thread history database when it has
+  not changed. Listing its threads reads every row of `thread_items`, and the
+  database can hold gigabytes: on one machine two Codex homes held about 4 GB
+  that had not changed in days, and a program that embeds SessionWiki and
+  syncs often spent about 16% of its CPU time reading them. The thread list is
+  now kept for the life of the process and read again when the size or
+  modification time of the database or its `-wal` file changes. A list read
+  within 10 seconds of a write is not kept, because SQLite can still be
+  completing that write.
+
+### Maintenance
+
+- Dependency auto-merge accepts the titles Dependabot gives its pull requests
+  here, `chore(deps): bump X from A to B` (and `chore(deps-dev):` for a
+  development dependency). It matched only `Bump X from A to B`, so it held
+  every update for review, including the patch update of rusqlite to 0.41.1
+  (#123). A title with any other prefix is still held.
+- Update rusqlite from 0.40.2 to 0.41.1, which moves the bundled SQLite from
+  3.53.2 to 3.54.1. The real-session check for the first sync change above
+  ran on this SQLite: the index synced in steps matched a fresh one row for
+  row and passed the FTS integrity check. The fixes in 0.41.1 (PRAGMA names
+  with SQLCipher, a deterministic function without arguments) touch nothing
+  sessionwiki uses.
 
 ## [0.34.21] - 2026-10-28
 
