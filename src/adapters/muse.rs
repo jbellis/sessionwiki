@@ -5,8 +5,8 @@
 //! payloads v1/v2, user-intent/metadata/name payloads v1.
 
 use super::{
-    bounded_redacted_output, dedup_paths, ok_or_flag, redacted_truncate, title_from_messages,
-    Adapter, Discovered, Store,
+    bounded_redacted_output, ok_or_flag, redacted_truncate, title_from_messages, Adapter,
+    Discovered, Store,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use anyhow::{ensure, Result};
@@ -251,7 +251,6 @@ impl Adapter for Muse {
             };
             crate::util::for_each_line(path, |line| provenance.line(line, stream.as_deref()))?;
             projection.cwd = provenance.cwd;
-            projection.touched = provenance.touched;
             projection.raw_paths = provenance.raw_paths;
         }
         let title = projection
@@ -270,8 +269,6 @@ impl Adapter for Muse {
             raw_cwd: projection.cwd,
             operational_edited_paths: super::dedup_raw_paths(projection.raw_paths),
             compacted_prefix: false,
-            touched: dedup_paths(projection.touched),
-            edits: Vec::new(),
         })
     }
 }
@@ -442,7 +439,6 @@ struct Projection {
     started: Option<DateTime<Utc>>,
     ended: Option<DateTime<Utc>>,
     messages: Vec<Message>,
-    touched: Vec<String>,
     raw_paths: Vec<String>,
     records: HashSet<String>,
     intents: HashSet<String>,
@@ -580,9 +576,6 @@ impl Projection {
             args = serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_owned()));
         }
         redact_json_strings(&mut args);
-        if is_write_operation(name) {
-            collect_paths(&args, &mut self.touched);
-        }
         if self.provenance_only {
             return;
         }
@@ -1187,7 +1180,6 @@ mod tests {
         let path = write(directory.path(), "session-1/session.jsonl", &records);
         let adapter = Muse::default();
         let raw = adapter.parse(&path).unwrap();
-        assert_eq!(raw.touched, ["src/lib.rs"]);
         assert!(!serde_json::to_string(&raw).unwrap().contains(secret));
         let Some(ToolEvent::Part(ToolPart::Call(call))) = &raw.messages[1].tool else {
             panic!("structured call missing");
@@ -1455,8 +1447,6 @@ mod tests {
         assert!(windowed);
         assert!(!window_lines.iter().any(|line| line.contains("middle.rs")));
         let parsed = parsed.unwrap();
-        assert_eq!(parsed.touched, full.touched);
-        assert_eq!(parsed.touched, ["head.rs", "middle.rs"]);
         assert_eq!(parsed.messages.len(), 4);
         assert!(parsed.messages.len() < full.messages.len());
         assert_eq!(

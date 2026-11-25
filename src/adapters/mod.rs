@@ -348,18 +348,6 @@ pub(crate) fn clean_path(p: &str) -> Option<String> {
     (!p.is_empty() && !p.contains('\n') && p.len() <= 4096).then(|| p.to_string())
 }
 
-/// Tidy the list of files a session touched: `clean_path` each, then de-duplicate
-/// while preserving first-seen order. A session edits the same file many times;
-/// the link cares only that it did.
-pub(crate) fn dedup_paths(paths: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    paths
-        .into_iter()
-        .filter_map(|p| clean_path(&p))
-        .filter(|p| seen.insert(p.clone()))
-        .collect()
-}
-
 /// Dedupe native paths by literal spelling, preserving encounter order.
 pub(crate) fn dedup_raw_paths(mut paths: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();

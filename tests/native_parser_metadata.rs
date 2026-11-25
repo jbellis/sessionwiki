@@ -22,8 +22,8 @@ fn native_id(adapter: &dyn Adapter, path: &Path) -> Option<String> {
 }
 
 #[test]
-fn index_schema_stays_at_nine() {
-    assert_eq!(sessionwiki::index::SCHEMA_VERSION, 9);
+fn index_schema_is_ten() {
+    assert_eq!(sessionwiki::index::SCHEMA_VERSION, 10);
 }
 
 #[test]
@@ -107,7 +107,6 @@ fn claude_uses_literal_primary_cwd_and_completed_edits_per_log() {
             "/child "
         ]
     );
-    assert!(!s.touched.iter().any(|path| path == "/read"));
     assert!(s.compacted_prefix);
     let prompts: Vec<_> = s
         .messages
@@ -225,10 +224,6 @@ fn codex_reads_paginated_items_and_literal_compressed_identity() {
         ]
     );
     assert_eq!(s.operational_edited_paths, ["z-last ", "a-first"]);
-    assert_eq!(s.touched, ["z-last", "a-first"]);
-    assert_eq!(s.edits.len(), 1);
-    assert_eq!(s.edits[0].path, "z-last");
-    assert!(s.edits[0].snippet.contains("+new"));
     fs::remove_file(&path).unwrap();
     assert_eq!(native_id(&adapter, &path).as_deref(), Some(SUFFIX));
     assert_eq!(

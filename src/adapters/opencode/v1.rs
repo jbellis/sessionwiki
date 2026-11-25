@@ -1,8 +1,6 @@
 //! Existing v1 SQLite and legacy JSON decoding.
 use super::{display_path, push, redact_json_strings};
-use crate::adapters::{
-    bounded_redacted_output, dedup_paths, redacted_truncate, title_from_messages,
-};
+use crate::adapters::{bounded_redacted_output, redacted_truncate, title_from_messages};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::{Context, Result};
@@ -131,8 +129,6 @@ pub(super) fn parse_sql(
         raw_cwd,
         operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
         compacted_prefix: false,
-        touched: dedup_paths(touched),
-        edits: Vec::new(),
     })
 }
 
@@ -233,8 +229,6 @@ pub(super) fn parse_json(tool: &'static str, path: &Path) -> Result<Session> {
         raw_cwd,
         operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
         compacted_prefix: false,
-        touched: dedup_paths(touched),
-        edits: Vec::new(),
     })
 }
 
@@ -393,7 +387,7 @@ mod tests {
         assert!(!s.subagent);
         let roles: Vec<_> = s.messages.iter().map(|m| m.role.label()).collect();
         assert_eq!(roles, ["user", "assistant", "tool"]);
-        assert_eq!(s.touched, ["src/client.ts"]);
+        assert_eq!(s.operational_edited_paths, ["src/client.ts"]);
         assert_eq!(s.started, DateTime::from_timestamp_millis(1718630400000));
         assert_eq!(s.ended, DateTime::from_timestamp_millis(1718630500000));
 

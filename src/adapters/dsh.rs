@@ -7,7 +7,7 @@
 mod native;
 
 use super::{
-    bounded_redacted_output, dedup_paths, ok_or_flag, parse_ts, redacted_truncate, root_scope,
+    bounded_redacted_output, ok_or_flag, parse_ts, redacted_truncate, root_scope,
     title_from_messages, Adapter, Discovered, Store,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
@@ -194,7 +194,6 @@ fn parse_acp(path: &Path) -> Result<Session> {
         .and_then(Value::as_str)
         .and_then(parse_ts);
     let mut messages = Vec::new();
-    let mut touched = Vec::new();
     let mut raw_paths = Vec::new();
     for message in record["messages"].as_array().into_iter().flatten() {
         let role = match message.get("role").and_then(Value::as_str) {
@@ -254,9 +253,6 @@ fn parse_acp(path: &Path) -> Result<Session> {
                         raw_paths.push(path.to_owned());
                     }
                 }
-                if let Some(path) = args.get("path").and_then(Value::as_str) {
-                    touched.push(path.to_owned());
-                }
             }
             messages.push(Message::tool_call(
                 None,
@@ -294,8 +290,6 @@ fn parse_acp(path: &Path) -> Result<Session> {
         raw_cwd: record.get("cwd").and_then(Value::as_str).map(str::to_owned),
         operational_edited_paths: crate::adapters::dedup_raw_paths(raw_paths),
         compacted_prefix: false,
-        touched: dedup_paths(touched),
-        edits: Vec::new(),
     })
 }
 
@@ -338,7 +332,6 @@ mod tests {
         assert_eq!(session.title, "Repair search");
         assert!(session.started.is_some() && session.ended > session.started);
         assert!(session.subagent);
-        assert_eq!(session.touched, ["src/search.rs"]);
         assert_eq!(
             session
                 .messages

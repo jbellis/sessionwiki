@@ -1,7 +1,5 @@
 use super::{is_boilerplate, push, redact_json_strings};
-use crate::adapters::{
-    bounded_redacted_output, dedup_paths, title_from_messages, Adapter, Discovered, Store,
-};
+use crate::adapters::{bounded_redacted_output, title_from_messages, Adapter, Discovered, Store};
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::{Context, Result};
@@ -283,8 +281,6 @@ impl Adapter for CodexHistory {
             raw_cwd,
             operational_edited_paths: crate::adapters::dedup_raw_paths(touched.clone()),
             compacted_prefix: false,
-            touched: dedup_paths(touched),
-            edits: Vec::new(),
         })
     }
 }

@@ -1,9 +1,9 @@
 //! Antigravity IDE and agy CLI native JSONL histories.
 use super::{
-    bounded_redacted_output, clean_path, dedup_paths, parse_ts, redacted_truncate, root_scope,
-    title_from_messages, Adapter, Discovered, Store,
+    bounded_redacted_output, parse_ts, redacted_truncate, root_scope, title_from_messages, Adapter,
+    Discovered, Store,
 };
-use crate::model::{EditEvent, EditKind, Message, Role, Session, ToolCall, ToolResult};
+use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::{canonicalize_as_recorded, short_id};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -494,36 +494,10 @@ fn user_text(s: &str) -> &str {
         .unwrap_or(s)
         .trim()
 }
-fn edit(name: &str, input: &Value, ts: Option<DateTime<Utc>>) -> Option<EditEvent> {
-    let kind = match name {
-        "write_file" | "write_to_file" => EditKind::Write,
-        "edit_file" | "replace_file_content" | "multi_replace_file_content" => EditKind::Edit,
-        _ => return None,
-    };
-    let path = ["Path", "path", "file_path", "TargetFile"]
-        .iter()
-        .find_map(|k| input.get(k)?.as_str())?;
-    let text = [
-        "Replacement",
-        "replacement",
-        "ReplacementContent",
-        "Content",
-        "content",
-        "CodeContent",
-    ]
-    .iter()
-    .find_map(|k| input.get(k).and_then(Value::as_str))
-    .unwrap_or("");
-    Some(EditEvent {
-        path: path.to_owned(),
-        kind,
-        ts,
-        snippet: redacted_truncate(text, 200),
-    })
-}
+
 struct Pending {
     id: String,
-    edit: Option<EditEvent>,
+    edit: Option<String>,
 }
 fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
     let (lines, windowed) = crate::util::session_lines_keeping(path, |line| {
@@ -541,7 +515,6 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
         .collect();
     let mut links: HashMap<u64, String> = HashMap::new();
     let mut pending = VecDeque::<Pending>::new();
-    let mut edits = Vec::new();
     let mut started: Option<DateTime<Utc>> = None;
     let mut ended: Option<DateTime<Utc>> = None;
     let mut raw_cwd = None;
@@ -595,13 +568,8 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
                     if v.get("status").and_then(Value::as_str) == Some("DONE")
                         && !v.get("is_error").and_then(Value::as_bool).unwrap_or(false)
                     {
-                        if let Some(mut edit) = call.edit {
-                            edit.ts = ts.or(edit.ts);
-                            raw_paths.push(edit.path.clone());
-                            if let Some(path) = clean_path(&edit.path) {
-                                edit.path = path;
-                                edits.push(edit);
-                            }
+                        if let Some(edit) = call.edit {
+                            raw_paths.push(edit);
                         }
                     }
                     if let Some(step) = record_id(&v).filter(|step| wanted.contains(step)) {
@@ -693,9 +661,24 @@ fn parse_transcript(path: &Path, key: &str) -> Result<Session> {
         raw_cwd,
         operational_edited_paths: super::dedup_raw_paths(raw_paths),
         compacted_prefix: false,
-        touched: dedup_paths(edits.iter().map(|e| e.path.clone()).collect()),
-        edits,
     })
+}
+
+fn edit(name: &str, input: &Value, _ts: Option<DateTime<Utc>>) -> Option<String> {
+    if !matches!(
+        name,
+        "write_file"
+            | "write_to_file"
+            | "edit_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+    ) {
+        return None;
+    }
+    ["Path", "path", "file_path", "TargetFile"]
+        .iter()
+        .find_map(|k| input.get(k)?.as_str())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]

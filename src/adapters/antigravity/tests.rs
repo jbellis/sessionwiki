@@ -44,7 +44,6 @@ fn native_capture_parses_messages_and_paired_tools() {
         s.messages.iter().filter(|m| m.role == Role::Tool).count(),
         3
     );
-    assert!(s.edits.is_empty());
     assert_eq!(a.parse(&path).unwrap().id, s.id);
     assert!(a.modified_at(&store.keys[0].0).is_some());
 }
@@ -149,7 +148,6 @@ fn only_completed_edits_are_evidence_and_arguments_are_redacted() {
             &edit_log(status),
         );
         let s = crate::adapters::parse_session(&a, &p).unwrap();
-        assert_eq!(s.edits.len(), usize::from(status == "DONE"));
         assert!(
             !format!("{:?}", s.messages).contains("sk-test_abcdefghijklmnopqrstuvwxyz0123456789")
         );
@@ -175,8 +173,10 @@ fn windowed_transcripts_keep_middle_edit_provenance() {
     crate::util::TEST_WINDOW.with(|w| w.set(Some((400, 100, 120))));
     let _reset = Reset;
     let window = a.parse(&p).unwrap();
-    assert_eq!(whole.edits.len(), window.edits.len());
-    assert_eq!(window.edits[0].path, "src/auth.rs");
+    assert_eq!(
+        whole.operational_edited_paths,
+        window.operational_edited_paths
+    );
 }
 #[test]
 fn malformed_lines_and_empty_files_are_tolerated() {

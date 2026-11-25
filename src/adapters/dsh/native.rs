@@ -2,10 +2,9 @@
 //! immutable generations inside it are snapshots, never separate sessions.
 
 use super::super::{
-    bounded_redacted_output, clean_path, dedup_paths, ok_or_flag, redacted_truncate,
-    title_from_messages, Store,
+    bounded_redacted_output, ok_or_flag, redacted_truncate, title_from_messages, Store,
 };
-use crate::model::{EditEvent, EditKind, Message, Role, Session, ToolCall, ToolResult};
+use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::{for_each_line, session_lines, short_id};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, Utc};
@@ -376,7 +375,7 @@ pub(super) fn parse(key: &str) -> Result<Session> {
         }
     }
 
-    let mut edits: Vec<_> = if windowed {
+    let edits: Vec<_> = if windowed {
         // The bounded conversation window omits most tool calls and results.
         // Recover provenance one row at a time, retaining only edit evidence.
         complete_edits(&selected.path)?
@@ -393,18 +392,7 @@ pub(super) fn parse(key: &str) -> Result<Session> {
             && change_token(&after.path, &regular_file(&after.path)?)? == before,
         "native session changed while reading; retry on the next sync"
     );
-    let operational_edited_paths =
-        super::super::dedup_raw_paths(edits.iter().map(|edit| edit.path.clone()).collect());
-    edits.retain_mut(|edit| {
-        let redacted = crate::redact::redact(&edit.path);
-        if let Some(path) = clean_path(&redacted) {
-            edit.path = path;
-            true
-        } else {
-            false
-        }
-    });
-    let touched = dedup_paths(edits.iter().map(|edit| edit.path.clone()).collect());
+    let operational_edited_paths = super::super::dedup_raw_paths(edits.clone());
     let title = title
         .or(human_title)
         .unwrap_or_else(|| title_from_messages(&messages));
@@ -425,12 +413,10 @@ pub(super) fn parse(key: &str) -> Result<Session> {
         raw_cwd: header["cwd"].as_str().map(str::to_owned),
         operational_edited_paths,
         compacted_prefix: false,
-        touched,
-        edits,
     })
 }
 
-fn complete_edits(path: &Path) -> Result<Vec<EditEvent>> {
+fn complete_edits(path: &Path) -> Result<Vec<String>> {
     let mut edits = Vec::new();
     let mut calls = HashSet::new();
     let mut failed = HashSet::new();
@@ -548,7 +534,7 @@ fn add_call(
     ts: Option<DateTime<Utc>>,
     calls: &mut HashSet<String>,
     messages: &mut Vec<Message>,
-    edits: &mut Vec<(String, EditEvent)>,
+    edits: &mut Vec<(String, String)>,
 ) {
     let (Some(id), Some(name)) = (data[id_field].as_str(), data["name"].as_str()) else {
         return;
@@ -608,40 +594,6 @@ fn add_result(
     ));
 }
 
-fn edit_event(name: &str, args: &Value, ts: Option<DateTime<Utc>>) -> Option<EditEvent> {
-    let (kind, snippet) = match name {
-        "write" => (
-            EditKind::Write,
-            args["content"].as_str().unwrap_or_default(),
-        ),
-        "edit" => (
-            EditKind::Edit,
-            args["new_string"].as_str().unwrap_or_default(),
-        ),
-        "str_replace_editor" => match args["command"].as_str()? {
-            "create" => (
-                EditKind::Write,
-                args["file_text"].as_str().unwrap_or_default(),
-            ),
-            "str_replace" | "insert" => {
-                (EditKind::Edit, args["new_str"].as_str().unwrap_or_default())
-            }
-            _ => return None,
-        },
-        _ => return None,
-    };
-    let path = args["file_path"]
-        .as_str()
-        .or_else(|| args["path"].as_str())?
-        .to_owned();
-    Some(EditEvent {
-        path,
-        kind,
-        snippet: redacted_truncate(snippet.trim(), 2000),
-        ts,
-    })
-}
-
 fn redact_values(value: &mut Value) {
     match value {
         Value::String(s) => *s = crate::redact::redact(s).into_owned(),
@@ -669,6 +621,22 @@ fn encode_segment(id: &str) -> String {
         }
     }
     out
+}
+
+fn edit_event(name: &str, args: &Value, _ts: Option<DateTime<Utc>>) -> Option<String> {
+    if !matches!(name, "write" | "edit")
+        && !(name == "str_replace_editor"
+            && matches!(
+                args["command"].as_str(),
+                Some("create" | "str_replace" | "insert")
+            ))
+    {
+        return None;
+    }
+    args["file_path"]
+        .as_str()
+        .or_else(|| args["path"].as_str())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -794,10 +762,6 @@ mod tests {
         assert_eq!(session.ended.unwrap().timestamp_millis(), 1_700_000_000_010);
         assert_eq!(session.messages.len(), 6);
         assert_eq!(session.messages[1].text, "I will fix it.");
-        assert_eq!(session.touched, ["/work/a.rs"]);
-        assert_eq!(session.edits.len(), 1);
-        assert_eq!(session.edits[0].kind, EditKind::Write);
-        assert_eq!(session.edits[0].snippet, "let fixed = true;");
         crate::tool_summary::fold_tool_parts(&mut session);
         assert_eq!(session.messages.len(), 4);
         let Some(ToolEvent::Summary(summary)) = &session.messages[2].tool else {
@@ -1039,7 +1003,6 @@ mod tests {
         );
         let mut session = parsed(&dir);
         assert_eq!(session.messages.len(), 4);
-        assert_eq!(session.touched, ["/work/a.rs", "/work/b.rs"]);
         crate::tool_summary::fold_tool_parts(&mut session);
         assert_eq!(session.messages.len(), 2);
     }
@@ -1203,18 +1166,7 @@ mod tests {
             let session = parse(dir.to_str().unwrap());
             crate::util::TEST_WINDOW.with(|w| w.set(None));
             let session = session.unwrap();
-            assert_eq!(
-                session.touched,
-                ["/work/middle.rs", "/work/nested.rs", "/work/pending.rs"]
-            );
-            assert_eq!(session.edits.len(), 3);
-            assert!(session.edits[0].snippet.contains("[redacted:"));
             assert!(!serde_json::to_string(&session).unwrap().contains(&secret));
-            assert_eq!(session.edits[1].snippet, "nested fix");
-            assert_eq!(
-                session.edits[1].ts.unwrap().timestamp_millis(),
-                1_700_000_000_035
-            );
             assert!(session.title.starts_with("[large] first prompt"));
             assert_eq!(session.messages.last().unwrap().text, "last prompt");
             assert!(session.messages.len() < 10);

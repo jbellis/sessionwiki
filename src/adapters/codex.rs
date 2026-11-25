@@ -1,8 +1,7 @@
 use super::{
-    bounded_redacted_output, dedup_paths, ok_or_flag, parse_ts, title_from_messages, Adapter,
-    Discovered,
+    bounded_redacted_output, ok_or_flag, parse_ts, title_from_messages, Adapter, Discovered,
 };
-use crate::model::{EditEvent, EditKind, Message, Role, Session, ToolCall, ToolResult};
+use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::short_id;
 use anyhow::Result;
 use serde::Deserialize;
@@ -447,13 +446,6 @@ impl Adapter for Codex {
         };
 
         let operational_edited_paths = evidence.operational_paths();
-        let touched = dedup_paths(
-            evidence
-                .patches
-                .applied()
-                .chain(evidence.completed_paths.iter().cloned())
-                .collect(),
-        );
 
         Ok(Session {
             id: short_id(&path.to_string_lossy()),
@@ -468,8 +460,6 @@ impl Adapter for Codex {
             raw_cwd: evidence.cwd,
             operational_edited_paths,
             compacted_prefix: evidence.compacted_prefix,
-            touched,
-            edits: evidence.edits,
         })
     }
 }
@@ -746,7 +736,6 @@ struct RolloutEvidence {
     patches: Patches,
     completed_paths: Vec<String>,
     has_file_change: bool,
-    edits: Vec<EditEvent>,
 }
 
 impl RolloutEvidence {
@@ -879,7 +868,7 @@ impl RolloutEvidence {
         line: &str,
         id: Option<&str>,
         status: Option<&str>,
-        ts: Option<chrono::DateTime<chrono::Utc>>,
+        _ts: Option<chrono::DateTime<chrono::Utc>>,
     ) {
         self.has_file_change = true;
         if let (Some(id), Some("failed" | "declined")) = (id, status) {
@@ -888,29 +877,11 @@ impl RolloutEvidence {
         if status != Some("completed") {
             return;
         }
-        let Ok(CompletedChange { timestamp, payload }) =
-            serde_json::from_str::<CompletedChange>(line)
-        else {
+        let Ok(CompletedChange { payload }) = serde_json::from_str::<CompletedChange>(line) else {
             return;
         };
-        let ts = ts.or_else(|| timestamp.as_deref().and_then(parse_ts));
-        for (raw, change) in payload.item.changes.0 {
-            self.completed_paths.push(raw.clone());
-            let diff = super::nonblank(&change["diff"])
-                .or_else(|| super::nonblank(&change["unified_diff"]))
-                .or_else(|| super::nonblank(&change["content"]));
-            if let (Some(path), Some(diff)) = (super::clean_path(&raw), diff) {
-                let kind = match change["type"].as_str().or_else(|| change["kind"].as_str()) {
-                    Some("add" | "write" | "create") => EditKind::Write,
-                    _ => EditKind::Edit,
-                };
-                self.edits.push(EditEvent {
-                    path,
-                    kind,
-                    snippet: super::redacted_truncate(diff, 200),
-                    ts,
-                });
-            }
+        for (raw, _) in payload.item.changes.0 {
+            self.completed_paths.push(raw);
         }
     }
 
@@ -926,8 +897,6 @@ impl RolloutEvidence {
 
 #[derive(Deserialize)]
 struct CompletedChange {
-    #[serde(alias = "time")]
-    timestamp: Option<String>,
     payload: ChangePayload,
 }
 
@@ -1090,13 +1059,6 @@ impl Patches {
         } else if !is_error && !output.trim().is_empty() {
             self.confirmed.insert(id);
         }
-    }
-
-    fn applied(&self) -> impl Iterator<Item = String> + '_ {
-        self.calls
-            .iter()
-            .filter(|(id, _)| id.as_ref().is_none_or(|id| !self.failed.contains(id)))
-            .flat_map(|(_, paths)| paths.iter().cloned())
     }
 
     fn confirmed(&self) -> impl Iterator<Item = String> + '_ {
@@ -1493,7 +1455,6 @@ mod tests {
             crate::util::TEST_WINDOW.with(|w| w.set(window));
             let session = Codex::default().parse(&file).unwrap();
             crate::util::TEST_WINDOW.with(|w| w.set(None));
-            assert_eq!(session.touched, ["success.rs"]);
             assert_eq!(session.operational_edited_paths, ["success.rs"]);
         }
     }
@@ -1616,7 +1577,6 @@ mod tests {
                 "{:?}",
                 s.operational_edited_paths
             );
-            assert_eq!(s.touched, ["raw"]);
         }
     }
 
@@ -1649,8 +1609,6 @@ mod tests {
         assert!(session.compacted_prefix);
         assert_eq!(session.raw_cwd.as_deref(), Some("/middle-only  "));
         assert_eq!(session.operational_edited_paths, ["done  "]);
-        assert_eq!(session.touched, ["done"]);
-        assert_eq!(session.edits[0].path, "done");
         assert_eq!(
             session
                 .messages
@@ -1874,28 +1832,16 @@ mod tests {
             + "\n"
     }
 
-    const APPLIED: [&str; 7] = [
-        "src/f.rs",
-        "src/g.rs",
-        "src/h.rs",
-        "src/ok.rs",
-        "src/p.rs",
-        "src/pending.rs",
-        "src/r.rs",
-    ];
-
-    fn sorted(mut paths: Vec<String>) -> Vec<String> {
-        paths.sort();
-        paths
-    }
-
     #[test]
     fn a_patch_codex_did_not_apply_edited_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("rollout-2026-10-01T00-00-00-abc.jsonl");
         std::fs::write(&file, failed_patch_rollout()).unwrap();
         let session = Codex::default().parse(&file).unwrap();
-        assert_eq!(sorted(session.touched), APPLIED);
+        assert_eq!(
+            session.operational_edited_paths,
+            ["src/ok.rs", "src/p.rs", "src/r.rs"]
+        );
     }
 
     /// The same when the patches sit in the middle of a windowed rollout.
@@ -1914,7 +1860,6 @@ mod tests {
         let session = Codex::default().parse(&file).unwrap();
         crate::util::TEST_WINDOW.with(|w| w.set(None));
         assert!(session.title.starts_with("[large]"), "{}", session.title);
-        assert_eq!(sorted(session.touched), APPLIED);
     }
 
     /// The same for a Codex rollout: its patches in the middle of a windowed
@@ -1938,9 +1883,6 @@ mod tests {
         let session = Codex::default().parse(&file).unwrap();
         crate::util::TEST_WINDOW.with(|w| w.set(None));
         assert!(session.title.starts_with("[large]"), "{}", session.title);
-        assert_eq!(session.touched.len(), 60, "{:?}", session.touched);
-        assert!(session.touched.contains(&"src/f15.rs".to_string()));
-        assert!(session.touched.contains(&"src/g15.rs".to_string()));
     }
 
     /// Only conversation is kept from the middle. A `compacted` record carries

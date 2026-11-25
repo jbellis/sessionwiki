@@ -444,8 +444,6 @@ mod tests {
             raw_cwd: None,
             operational_edited_paths: Vec::new(),
             compacted_prefix: false,
-            touched: vec![],
-            edits: vec![],
         }
     }
 

@@ -1,7 +1,7 @@
 //! Kimi Code's indexed session directories and main-agent wire stream.
 use super::{
-    bounded_redacted_output, dedup_paths, redacted_truncate, root_scope, title_from_messages,
-    Adapter, Discovered, Store,
+    bounded_redacted_output, redacted_truncate, root_scope, title_from_messages, Adapter,
+    Discovered, Store,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::{read_to_string_capped, short_id};
@@ -462,8 +462,6 @@ impl Adapter for KimiCode {
             raw_cwd,
             operational_edited_paths: super::dedup_raw_paths(touched.clone()),
             compacted_prefix,
-            touched: dedup_paths(touched),
-            edits: Vec::new(),
         })
     }
 }
@@ -845,7 +843,6 @@ mod tests {
         assert!(
             matches!(&session.messages[3].tool, Some(ToolEvent::Part(ToolPart::Result(result))) if !result.is_error && result.call_id.as_deref() == Some("ok"))
         );
-        assert_eq!(session.touched, vec!["src/lib.rs"]);
         assert!(!serde_json::to_string(&session).unwrap().contains(&secret));
         let folded = super::super::parse_session_key(&adapter, &path.to_string_lossy()).unwrap();
         assert!(folded
@@ -1287,7 +1284,7 @@ mod tests {
         let parsed = KimiCode::in_home(tmp.path()).parse(&path);
         crate::util::TEST_WINDOW.with(|w| w.set(None));
         let session = parsed.unwrap();
-        let mut touched = session.touched;
+        let mut touched = session.operational_edited_paths;
         touched.sort();
         assert_eq!(touched, vec!["main.rs", "sub.rs"]);
         assert!(!session.messages.iter().any(|m| m.text == "subagent text"));

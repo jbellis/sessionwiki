@@ -1,7 +1,7 @@
 //! Grok Build stores one conversation per `sessions/<encoded-cwd>/<uuid>`.
 use super::{
-    bounded_redacted_output, dedup_paths, redacted_truncate, root_scope, title_from_messages,
-    Adapter, Discovered, Store,
+    bounded_redacted_output, redacted_truncate, root_scope, title_from_messages, Adapter,
+    Discovered, Store,
 };
 use crate::model::{Message, Role, Session, ToolCall, ToolResult};
 use crate::util::{read_to_string_capped, short_id};
@@ -321,8 +321,6 @@ impl Adapter for GrokBuild {
             raw_cwd,
             operational_edited_paths: super::dedup_raw_paths(touched.clone()),
             compacted_prefix,
-            touched: dedup_paths(touched),
-            edits: Vec::new(),
         })
     }
 }
@@ -675,7 +673,6 @@ mod tests {
         assert!(
             matches!(&session.messages[5].tool, Some(ToolEvent::Part(ToolPart::Result(result))) if result.call_id.as_deref() == Some("one"))
         );
-        assert_eq!(session.touched, vec!["lib.rs"]);
         assert_eq!(session.started.unwrap().timestamp_millis(), 1704067200000);
         assert_eq!(session.ended.unwrap().timestamp_millis(), 1704067201000);
         let serialized = serde_json::to_string(&session).unwrap();
@@ -715,7 +712,6 @@ mod tests {
         assert!(
             matches!(&session.messages[1].tool, Some(ToolEvent::Part(ToolPart::Call(call))) if call.args == "{bad")
         );
-        assert!(session.touched.is_empty());
         fs::rename(path.join("chat_history.jsonl"), path.join("history.jsonl")).unwrap();
         assert_eq!(
             GrokBuild::in_home(tmp.path()).store().unwrap().keys.len(),
@@ -853,9 +849,9 @@ mod tests {
             ],
         );
         crate::util::TEST_WINDOW.with(|w| w.set(Some((100, 100, 100))));
-        let parsed = GrokBuild::in_home(tmp.path()).parse(&path);
+        let parsed = GrokBuild::in_home(tmp.path()).parse(&path).unwrap();
         crate::util::TEST_WINDOW.with(|w| w.set(None));
-        let session = parsed.unwrap();
+        let session = parsed;
         assert!(session.title.starts_with("[windowed]"));
         assert_eq!(
             session
@@ -883,8 +879,8 @@ mod tests {
             ],
         );
         crate::util::TEST_WINDOW.with(|w| w.set(Some((100, 100, 200))));
-        let parsed = GrokBuild::in_home(tmp.path()).parse(&path);
+        let parsed = GrokBuild::in_home(tmp.path()).parse(&path).unwrap();
+        assert_eq!(parsed.operational_edited_paths, ["middle.rs"]);
         crate::util::TEST_WINDOW.with(|w| w.set(None));
-        assert_eq!(parsed.unwrap().touched, vec!["middle.rs"]);
     }
 }

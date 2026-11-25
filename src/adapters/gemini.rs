@@ -292,8 +292,6 @@ impl Adapter for Gemini {
             raw_cwd: None,
             operational_edited_paths: Vec::new(),
             compacted_prefix: false,
-            touched: Vec::new(),
-            edits: Vec::new(),
         })
     }
 }

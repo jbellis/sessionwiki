@@ -13,7 +13,7 @@ fn seed(dir: &std::path::Path) {
     conn.execute_batch(
         "DELETE FROM files;
          INSERT INTO msgs(msgs,rowid,text) SELECT 'delete',id,text FROM messages;
-         DELETE FROM messages; DELETE FROM touched;",
+         DELETE FROM messages;",
     )
     .unwrap();
     // A title carrying an ESC and a raw newline: both must be stripped and must
@@ -90,7 +90,7 @@ fn golden_handshake_search_and_stream_purity() {
     assert_eq!(lines[0]["id"], 1);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(lines[1]["id"], "two");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 5);
     assert_eq!(lines[2]["id"], 3);
     let text = lines[2]["result"]["content"][0]["text"].as_str().unwrap();
     assert!(

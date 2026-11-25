@@ -6,6 +6,28 @@ semantic versioning once it reaches 1.0.
 
 ## [Unreleased]
 
+## [0.34.30] - 2026-11-24
+
+### Removed
+
+- The MCP server no longer offers `trace_file`. Agents find sessions with
+  `search_sessions`, `recent_sessions` and `related_sessions`, then read them
+  with `get_session_brief` and `session_window`. A client that still calls
+  `trace_file` gets the standard unknown-tool error (-32602). Restart any running
+  `sessionwiki mcp` servers after upgrading so clients see the new tool list.
+- File provenance is gone. The `trace`, `files` and `blame` commands, the
+  web UI's file chips and file-history panel, and the `/api/trace` and
+  `/api/file` endpoints no longer exist, and `session` JSON and `digest --json`
+  no longer carry `touched` or `files`. `related` ranks by shared project and
+  tags only, `stats` no longer counts linked files, `digest` and the session
+  start brief no longer list files, and the `sessionwiki-recall` plugin no
+  longer offers `trace`. The fork retains native `operational_edited_paths`, `raw_cwd`,
+  `compacted_prefix` and all native adapters and import APIs. Existing schema-9 indexes upgrade in place to schema 10,
+  dropping only the `touched` and `edits` tables. Live sessions, search data,
+  archives and curation survive. The durable schema remains at version 2;
+  the deprecated archive path column is retained and new rows write `[]`.
+
+
 ## [0.34.29] - 2026-11-24
 
 Merges upstream SessionWiki 0.34.24 through 0.34.26 into the fork. The index
